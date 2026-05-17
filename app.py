@@ -77,15 +77,6 @@ st.markdown("""
         font-size: 0.85rem;
         color: #5d4037;
     }
-    .formula-box {
-        background: #fafafa;
-        border: 1px solid #e0e0e0;
-        padding: 0.7rem 1rem;
-        border-radius: 6px;
-        font-family: 'Courier New', monospace;
-        font-size: 0.9rem;
-        margin: 0.5rem 0;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -110,37 +101,6 @@ MODELS = {
         "sens": 84.3,
         "spec": 85.6
     },
-    "SII": {
-        "auc": 0.883,
-        "intercept": -5.019412,
-        "coefs": {"SII": 0.007468},
-        "description": "Klasik kompozit indeks",
-        "cutoff": 653.59,
-        "sens": 83.1,
-        "spec": 82.2
-    },
-    "NLR": {
-        "auc": 0.860,
-        "intercept": -5.906572,
-        "coefs": {"NLR": 2.550406},
-        "description": "En basit oran — hızlı hesaplama",
-        "cutoff": 2.16,
-        "sens": 84.3,
-        "spec": 73.3
-    },
-    "SIRI + Yaş + Hastalık Süresi (düzeltilmiş)": {
-        "auc": 0.921,
-        "intercept": -6.259187,
-        "coefs": {
-            "SIRI": 5.034701,
-            "YAŞ": 0.002450,
-            "HASTALIK SÜRESİ": 0.013674
-        },
-        "description": "Yaş ve hastalık süresi düzeltmesi içerir",
-        "cutoff": None,
-        "sens": None,
-        "spec": None
-    },
 }
 
 # ====== BAŞLIK ======
@@ -157,10 +117,9 @@ with st.expander("ℹ️ Hesaplayıcı hakkında"):
     ayırt etmek için tasarlanmıştır.
 
     **Kullanım:**
-    1. Soldan bir model seçin (SIRI önerilen)
+    1. Modeli seçin (SIRI önerilen)
     2. Hastanın hemogram değerlerini girin
-    3. Model uygun ise yaş ve hastalık süresini de ekleyin
-    4. Otomatik hesaplanan olasılığı okuyun
+    3. Otomatik hesaplanan olasılığı okuyun
 
     **Eğitim verisi:** Yalnızca Behçet tanısı olan hastalardır.
     Bu hesaplayıcı **Behçet'i tanımlamaz** — hastalığın komplike olup
@@ -208,44 +167,20 @@ with c4:
 
 # İndeksleri hesapla
 try:
-    nlr = neu / lymph
-    plr = plt_val / lymph
-    nmlr = (neu + mono) / lymph
     siri = (neu * mono) / lymph
-    sii = (neu * plt_val) / lymph
     aisi = (plt_val * neu * mono) / lymph
 except ZeroDivisionError:
     st.error("Lenfosit 0 olamaz.")
     st.stop()
 
-# Hesaplanan indeksleri göster
+# Hesaplanan indeksleri göster (sadece kullandığımız iki indeks)
 st.markdown("#### Hesaplanan İnflamatuar İndeksler")
-ic1, ic2, ic3, ic4, ic5, ic6 = st.columns(6)
-ic1.metric("NLR", f"{nlr:.2f}")
-ic2.metric("PLR", f"{plr:.1f}")
-ic3.metric("NMLR", f"{nmlr:.2f}")
-ic4.metric("SIRI", f"{siri:.2f}")
-ic5.metric("SII", f"{sii:.0f}")
-ic6.metric("AISI", f"{aisi:.0f}")
-
-# Eğer model yaş/süre istiyorsa
-extra_vars = {}
-needs_extra = any(k in model['coefs'] for k in ['YAŞ', 'HASTALIK SÜRESİ'])
-if needs_extra:
-    st.markdown("#### Ek Klinik Değişkenler")
-    e1, e2 = st.columns(2)
-    with e1:
-        extra_vars['YAŞ'] = st.number_input("Yaş", min_value=15, max_value=90,
-                                              value=40, step=1)
-    with e2:
-        extra_vars['HASTALIK SÜRESİ'] = st.number_input("Hastalık süresi (yıl)",
-                                                          min_value=0, max_value=50,
-                                                          value=5, step=1)
+ic1, ic2 = st.columns(2)
+ic1.metric("SIRI", f"{siri:.2f}")
+ic2.metric("AISI", f"{aisi:.0f}")
 
 # ====== HESAPLAMA ======
-all_indices = {'SIRI': siri, 'AISI': aisi, 'SII': sii, 'NLR': nlr,
-               'PLR': plr, 'NMLR': nmlr}
-all_indices.update(extra_vars)
+all_indices = {'SIRI': siri, 'AISI': aisi}
 
 logit = model['intercept']
 for var, coef in model['coefs'].items():
@@ -328,27 +263,6 @@ if model.get('cutoff'):
         </div>
         """, unsafe_allow_html=True)
 
-# ====== TEKNİK DETAYLAR ======
-with st.expander("🔬 Teknik Detaylar (Model Formülü)"):
-    st.markdown("**Linear Predictor (η):**")
-    formula_parts = [f"{model['intercept']:+.4f}"]
-    for var, coef in model['coefs'].items():
-        formula_parts.append(f"({coef:+.4f}) × {var}")
-    st.markdown(f'<div class="formula-box">η = {" ".join(formula_parts)}</div>',
-                unsafe_allow_html=True)
-
-    st.markdown("**Olasılık:**")
-    st.markdown(f'<div class="formula-box">P = 1 / (1 + e^(-η)) = 1 / (1 + e^({-logit:.3f})) = {probability:.4f}</div>',
-                unsafe_allow_html=True)
-
-    st.markdown(f"""
-    **Şu hasta için hesaplanan değerler:**
-    - Linear predictor (η): `{logit:+.4f}`
-    - Log-odds: `{logit:+.4f}`
-    - Odds: `{math.exp(logit):.4f}`
-    - Olasılık: `{probability:.4f}` ({probability:.2%})
-    """)
-
 # ====== DISCLAIMER ======
 st.markdown("""
 <div class="disclaimer">
@@ -363,4 +277,4 @@ Bu hesaplayıcı tıbbi tavsiye yerine geçmez.
 """, unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("Behçet Risk Hesaplayıcı v1.0 · Lojistik regresyon tabanlı · Streamlit ile geliştirildi")
+st.caption("Behçet Risk Hesaplayıcı v1.0 · https://behcetrisc.streamlit.app/")
