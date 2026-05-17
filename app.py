@@ -1309,7 +1309,7 @@ with tab7:
                 """)
 
             try:
-                # Her değişken için katkı aralığı (params zaten yukarıda tanımlandı, MLE ya da Firth)
+                # Her değişken için katkı aralığı (params zaten yukarıda tanımlandı)
                 intercept = params['const']
                 var_info = []
                 for v in predictors:
@@ -1324,135 +1324,145 @@ with tab7:
                     })
 
                 max_range = max(vi['range'] for vi in var_info) if var_info else 1
-                scale = 100.0 / max_range if max_range > 0 else 1  # puan/lp birimi
+                scale = 100.0 / max_range if max_range > 0 else 1
                 total_max = sum(vi['range'] for vi in var_info) * scale
 
-                # Yardımcı: çakışmayı önleyecek tick yerleşimi
-                def smart_ticks(x_min, x_max, b, scale, min_pixel_gap=80, fig_width_px=1100):
-                    """
-                    Continuous değişken için tick'leri seç:
-                    - 'Güzel' yuvarlanmış sayılar üret (1, 2, 5, 10 gibi)
-                    - Birbirine çok yakın olanları ele
-                    - Etiketin yatay aralığını fig_width'e göre hesapla
-                    """
+                # Her değişkenin kendi puan aralığı (eksen genişliği için)
+                for vi in var_info:
+                    vi['max_pts'] = vi['range'] * scale  # bu değişkenin maksimum katkısı (puan)
+
+                # Yardımcı: yuvarlanmış "güzel" tick aralıkları
+                def nice_ticks(x_min, x_max, target_n=5):
+                    """Güzel yuvarlanmış tick'ler üret + x_min ve x_max'i de dahil et."""
                     rng = x_max - x_min
                     if rng <= 0:
-                        return [x_min], [f"{x_min:.0f}"]
-
-                    # "Güzel" adım belirle
-                    raw_step = rng / 5
+                        return [x_min], 1
+                    raw_step = rng / target_n
                     magnitude = 10 ** np.floor(np.log10(raw_step))
                     for mult in [1, 2, 2.5, 5, 10]:
                         step = mult * magnitude
-                        if rng / step <= 8:
+                        if rng / step <= target_n + 2:
                             break
-                    # tick'leri üret
                     start = np.ceil(x_min / step) * step
-                    ticks = np.arange(start, x_max + step*0.01, step)
-                    ticks = ticks[(ticks >= x_min) & (ticks <= x_max)]
-                    # Sınırları ekle, ama yakınsa atla
-                    if len(ticks) == 0 or abs(ticks[0] - x_min) > step * 0.3:
-                        ticks = np.concatenate([[x_min], ticks])
-                    if abs(ticks[-1] - x_max) > step * 0.3:
-                        ticks = np.concatenate([ticks, [x_max]])
+                    ticks = list(np.arange(start, x_max + step*0.5, step))
+                    ticks = [t for t in ticks if x_min - step*0.01 <= t <= x_max + step*0.01]
+                    # x_min ve x_max'i ekle (yakın değilse)
+                    if not ticks or abs(ticks[0] - x_min) > step * 0.25:
+                        ticks = [x_min] + ticks
+                    if abs(ticks[-1] - x_max) > step * 0.25:
+                        ticks = ticks + [x_max]
+                    return ticks, step
 
-                    # Etiketleri formatla
-                    if step >= 1:
-                        labels = [f"{t:.0f}" for t in ticks]
-                    else:
-                        decimals = max(0, int(-np.floor(np.log10(step))))
-                        labels = [f"{t:.{decimals}f}" for t in ticks]
-
-                    # Pixel cinsinden çakışma kontrolü
-                    pts = [(t - x_min) * abs(b) * scale if b > 0 else
-                           (x_max - t) * abs(b) * scale for t in ticks]
-                    # Eğer pts içinde mesafe < min_pixel_gap (puan biriminde) ise filtrele
-                    # Puan ekseni 100 birim → pixel cinsinden gap = (gap_pts/100)*fig_width_px
-                    # tersi: min_pts_gap = (min_pixel_gap/fig_width_px)*100
-                    min_pts_gap = (min_pixel_gap / fig_width_px) * 100
-                    keep = [True]
-                    last_pt = pts[0]
-                    for i in range(1, len(pts)):
-                        if abs(pts[i] - last_pt) >= min_pts_gap:
-                            keep.append(True)
-                            last_pt = pts[i]
-                        else:
-                            keep.append(False)
-                    # Son tick'i her zaman tut (sınır)
-                    if not keep[-1] and len(keep) > 1:
-                        keep[-1] = True
-                        # Eğer son ile bir önceki çok yakınsa, bir öncekini ele
-                        if len(pts) >= 2 and abs(pts[-1] - pts[-2]) < min_pts_gap:
-                            keep[-2] = False
-                    ticks_f = [t for t, k in zip(ticks, keep) if k]
-                    labels_f = [l for l, k in zip(labels, keep) if k]
-                    return ticks_f, labels_f
-
+                # Şekil: hepsi 0-100 ekseninde, ama her değişken kendi max_pts kadarını kullanır
                 n_axes = 1 + len(predictors) + 2
                 fig_n, axes_n = plt.subplots(n_axes, 1,
-                                               figsize=(14, 0.75*n_axes + 1.5))
-                plt.subplots_adjust(hspace=1.2, left=0.18, right=0.96,
+                                               figsize=(14, 0.85*n_axes + 1.5))
+                plt.subplots_adjust(hspace=1.4, left=0.18, right=0.96,
                                      top=0.93, bottom=0.05)
 
-                def draw_axis(ax, xmin, xmax, ticks, labels, title, color='black',
-                                fontsize=9):
-                    ax.set_xlim(xmin, xmax * 1.02)
+                def draw_axis(ax, xmin, xmax, ticks, labels, title,
+                                color='black', fontsize=10, axis_end=100):
+                    """axis_end: eksenin görsel olarak uzandığı yer (puan)."""
+                    ax.set_xlim(-2, axis_end + 2)
                     ax.set_ylim(0, 1)
-                    ax.hlines(0.5, xmin, xmax, color=color, lw=1.5)
+                    # Sadece kullanılan bölgede çizgi çiz (sağa boş uzantı yok)
+                    line_end = max(ticks) if ticks else xmax
+                    ax.hlines(0.5, xmin, line_end, color=color, lw=1.5)
                     for t, lbl in zip(ticks, labels):
-                        if xmin - 0.5 <= t <= xmax + 0.5:
-                            ax.vlines(t, 0.4, 0.6, color=color, lw=1.2)
-                            ax.text(t, -0.15, lbl, ha='center', va='top',
-                                    fontsize=fontsize)
+                        ax.vlines(t, 0.4, 0.6, color=color, lw=1.2)
+                        ax.text(t, -0.15, lbl, ha='center', va='top',
+                                fontsize=fontsize)
                     ax.set_yticks([]); ax.set_xticks([])
                     ax.set_ylabel(title, rotation=0, ha='right', va='center',
-                                   fontsize=10, labelpad=20)
+                                   fontsize=10.5, labelpad=20, fontweight='bold')
                     for sp in ax.spines.values(): sp.set_visible(False)
 
-                # 1) Üst eksen: Points (0-100)
-                pts_ticks = np.arange(0, 101, 10)
+                # 1) Üst eksen: Points (0-100, 10'arlı)
+                pts_ticks = list(np.arange(0, 101, 10))
                 draw_axis(axes_n[0], 0, 100, pts_ticks,
                            [str(int(t)) for t in pts_ticks], "Points",
-                           color='#2E86AB', fontsize=9)
+                           color='#2E86AB', fontsize=9, axis_end=100)
 
-                # 2) Her değişken için bir eksen — akıllı tick yerleşimi
+                # 2) Her değişken için bir eksen — kendi max_pts kadarını kullanır
+                # Tüm eksenler "düşük risk → yüksek risk" yönünde (soldan sağa puan artar)
                 for i, vi in enumerate(var_info):
                     ax = axes_n[i + 1]
                     if vi['is_binary']:
+                        # 0 ve 1 — düşük katkılı sol, yüksek katkılı sağ
                         if vi['b'] > 0:
-                            pts = [0, vi['b'] * scale]
+                            # b>0: değer arttıkça risk artar → 0 sol, 1 sağ
+                            pts = [0, vi['max_pts']]
                             labels = ['0', '1']
                         else:
-                            pts = [abs(vi['b']) * scale, 0]
-                            labels = ['0', '1']
-                        draw_axis(ax, 0, 100, pts, labels, vi['name'], fontsize=10)
+                            # b<0: değer arttıkça risk azalır → 1 sol, 0 sağ
+                            pts = [0, vi['max_pts']]
+                            labels = ['1', '0']
+                        draw_axis(ax, 0, vi['max_pts'], pts, labels,
+                                    vi['name'], fontsize=10, axis_end=100)
                     else:
-                        x_ticks, x_labels = smart_ticks(vi['x_min'], vi['x_max'],
-                                                          vi['b'], scale,
-                                                          min_pixel_gap=90)
-                        if vi['b'] > 0:
-                            pts = [(x - vi['x_min']) * vi['b'] * scale
-                                   for x in x_ticks]
+                        # Continuous — tick yoğunluğu eksenin gerçek genişliğine göre
+                        if vi['max_pts'] < 20:
+                            target_n = 2
+                        elif vi['max_pts'] < 40:
+                            target_n = 3
+                        elif vi['max_pts'] < 70:
+                            target_n = 4
                         else:
-                            pts = [(vi['x_max'] - x) * abs(vi['b']) * scale
-                                   for x in x_ticks]
-                        draw_axis(ax, 0, 100, pts, x_labels, vi['name'], fontsize=9)
+                            target_n = 5
+                        x_ticks, x_step = nice_ticks(vi['x_min'], vi['x_max'],
+                                                       target_n=target_n)
+                        if x_step >= 1:
+                            x_labels = [f"{t:.0f}" for t in x_ticks]
+                        else:
+                            decimals = max(1, int(-np.floor(np.log10(x_step))))
+                            x_labels = [f"{t:.{decimals}f}" for t in x_ticks]
+
+                        # b>0: x_min → 0 puan, x_max → max puan (etiket sırası: küçükten büyüğe)
+                        # b<0: x_min → max puan, x_max → 0 puan
+                        #      → etiketler GÖRSEL OLARAK ters yönde, ama biz fiziksel yön olarak
+                        #        sol=0puan, sağ=maxpuan tutuyoruz. Bu yüzden b<0 ise
+                        #        etiketler büyükten küçüğe gider (mantıklı, çünkü sol az risk)
+                        if vi['b'] > 0:
+                            pts = [(t - vi['x_min']) * vi['b'] * scale
+                                   for t in x_ticks]
+                        else:
+                            pts = [(vi['x_max'] - t) * abs(vi['b']) * scale
+                                   for t in x_ticks]
+
+                        if vi['max_pts'] < 20:
+                            min_gap = vi['max_pts'] / 3
+                        else:
+                            min_gap = max(8, vi['max_pts'] / 8)
+                        order = np.argsort(pts)
+                        pts_s = [pts[k] for k in order]
+                        lbl_s = [x_labels[k] for k in order]
+                        kept_pts, kept_lbl = [pts_s[0]], [lbl_s[0]]
+                        for p, l in zip(pts_s[1:], lbl_s[1:]):
+                            if p - kept_pts[-1] >= min_gap:
+                                kept_pts.append(p)
+                                kept_lbl.append(l)
+                        # Eksen başlığına β yönünü ekle (≥/≤ işaretiyle)
+                        direction_marker = " ↑" if vi['b'] > 0 else " ↓"
+                        draw_axis(ax, 0, vi['max_pts'], kept_pts, kept_lbl,
+                                    vi['name'] + direction_marker,
+                                    fontsize=9, axis_end=100)
 
                 # 3) Total Points — daha az tick
-                # Hedef: ~8-10 tick, çakışmasız
-                tot_step_raw = total_max / 8
+                tot_target = 8
+                tot_step_raw = total_max / tot_target
                 tot_mag = 10 ** np.floor(np.log10(tot_step_raw))
                 for mult in [1, 2, 2.5, 5, 10]:
                     tot_step = mult * tot_mag
-                    if total_max / tot_step <= 12: break
-                tot_ticks = np.arange(0, total_max + tot_step*0.01, tot_step)
+                    if total_max / tot_step <= tot_target + 2: break
+                tot_ticks = list(np.arange(0, total_max + tot_step*0.5, tot_step))
                 draw_axis(axes_n[-2], 0, total_max, tot_ticks,
-                           [f"{t:.0f}" for t in tot_ticks], "Total\nPoints",
-                           color='#A23B72', fontsize=9)
+                           [f"{t:.0f}" for t in tot_ticks], "Total Points",
+                           color='#A23B72', fontsize=9, axis_end=total_max)
 
-                # 4) Predicted Probability
-                prob_levels = [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
-                prob_ticks, prob_labels = [], []
+                # 4) Predicted Probability — TEMSILI olasılıklar, ÇAKIŞMASIZ
+                # Pratik olasılık seviyeleri:
+                prob_levels = [0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95]
+                prob_ticks_raw, prob_labels_raw = [], []
                 min_contribs_sum = sum(
                     vi['b'] * vi['x_min'] if vi['b'] > 0 else vi['b'] * vi['x_max']
                     for vi in var_info
@@ -1462,22 +1472,24 @@ with tab7:
                     lp_total = logit_p - intercept
                     tp = (lp_total - min_contribs_sum) * scale
                     if 0 <= tp <= total_max:
-                        prob_ticks.append(tp)
-                        prob_labels.append(f"{p:.2f}")
+                        prob_ticks_raw.append(tp)
+                        prob_labels_raw.append(f"{p:.2f}")
 
-                # Olasılık tick'lerinde de çakışma kontrolü
-                if len(prob_ticks) > 1:
-                    min_gap = total_max * 0.05  # En az %5'lik boşluk
-                    filtered_t, filtered_l = [prob_ticks[0]], [prob_labels[0]]
-                    for t, l in zip(prob_ticks[1:], prob_labels[1:]):
-                        if t - filtered_t[-1] >= min_gap:
-                            filtered_t.append(t)
-                            filtered_l.append(l)
-                    prob_ticks, prob_labels = filtered_t, filtered_l
+                # Çakışma kontrolü — gevşek (etiketler kısa, yer yetebilir)
+                min_gap_prob = total_max * 0.04
+                if prob_ticks_raw:
+                    prob_ticks = [prob_ticks_raw[0]]
+                    prob_labels = [prob_labels_raw[0]]
+                    for t, l in zip(prob_ticks_raw[1:], prob_labels_raw[1:]):
+                        if t - prob_ticks[-1] >= min_gap_prob:
+                            prob_ticks.append(t)
+                            prob_labels.append(l)
+                else:
+                    prob_ticks, prob_labels = [], []
 
                 draw_axis(axes_n[-1], 0, total_max, prob_ticks, prob_labels,
                            "Predicted\nProbability\n(Komplike)",
-                           color='#F18F01', fontsize=9)
+                           color='#F18F01', fontsize=9, axis_end=total_max)
 
                 fig_n.suptitle(
                     f"Nomogram — Komplike Behçet Risk Tahmini\n"
