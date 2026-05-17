@@ -1505,6 +1505,323 @@ with tab7:
             except Exception as e:
                 st.warning(f"Nomogram çizilemedi: {e}")
 
+            # ─── KALİBRASYON EĞRİSİ + HOSMER-LEMESHOW ───
+            st.markdown("---")
+            st.markdown("### 📏 Kalibrasyon — Modelin Güvenilirliği")
+            with st.expander("ℹ️ Kalibrasyon nedir, niye önemli?"):
+                st.markdown("""
+                **Ayırt etme (discrimination)** ≠ **kalibrasyon**.
+                - **AUC** modelin "hangi hastanın komplike olduğunu" doğru sıralayıp sıralamadığını söyler.
+                - **Kalibrasyon** ise "%80 risk dedik, gerçekten %80'i komplike çıktı mı?" sorusunu cevaplar.
+
+                Bir model AUC'si yüksek olsa bile **sistematik olarak yüksek/düşük risk** tahmin edebilir.
+                Nomogram makalelerinde **kalibrasyon eğrisi mecburidir**.
+
+                - **Diagonal yakın eğri** = iyi kalibrasyon
+                - **Hosmer-Lemeshow p > 0.05** = anlamlı sapma yok (iyi)
+                - **Brier skoru** (0–1, düşük iyi); 0.25 = chance, 0 = mükemmel
+                """)
+
+            try:
+                # Tahmin edilen olasılıklar
+                pred_probs = np.asarray(pred_full).flatten()
+                y_actual = y_lr.values
+
+                # 10 desile böl (Hosmer-Lemeshow standart)
+                n_bins = 10
+                # Eşit-frekans bins (decile)
+                bins = np.unique(np.quantile(pred_probs, np.linspace(0, 1, n_bins+1)))
+                if len(bins) < 3:
+                    n_bins = max(3, len(bins) - 1)
+                    bins = np.unique(np.quantile(pred_probs, np.linspace(0, 1, n_bins+1)))
+                bin_idx = np.digitize(pred_probs, bins[1:-1])
+
+                cal_data = []
+                hl_stat = 0
+                for k in range(n_bins):
+                    mask = (bin_idx == k)
+                    n_k = mask.sum()
+                    if n_k == 0: continue
+                    obs_freq = y_actual[mask].mean()
+                    exp_freq = pred_probs[mask].mean()
+                    obs_count = y_actual[mask].sum()
+                    exp_count = pred_probs[mask].sum()
+                    cal_data.append({
+                        'bin': k+1, 'n': int(n_k),
+                        'observed': obs_freq, 'expected': exp_freq,
+                        'obs_count': int(obs_count), 'exp_count': exp_count
+                    })
+                    # Hosmer-Lemeshow chi-square
+                    if exp_count > 0 and (n_k - exp_count) > 0:
+                        hl_stat += ((obs_count - exp_count)**2 / exp_count +
+                                     ((n_k - obs_count) - (n_k - exp_count))**2 /
+                                     (n_k - exp_count))
+                hl_df = max(1, n_bins - 2)
+                hl_p = stats.chi2.sf(hl_stat, df=hl_df)
+
+                # Brier skoru
+                brier = np.mean((pred_probs - y_actual)**2)
+
+                # Calibration plot
+                fig_cal, ax_cal = plt.subplots(figsize=(8, 7))
+                obs = [d['observed'] for d in cal_data]
+                exp = [d['expected'] for d in cal_data]
+                sizes = [d['n']*8 for d in cal_data]
+
+                # Mükemmel kalibrasyon çizgisi
+                ax_cal.plot([0,1], [0,1], 'k--', alpha=0.5, lw=1.5,
+                            label='Mükemmel kalibrasyon')
+                # Veri noktaları
+                ax_cal.scatter(exp, obs, s=sizes, alpha=0.7,
+                                c='#2E86AB', edgecolors='black', zorder=3,
+                                label='Decile grupları (boyut = n)')
+                # Lowess eğrisi (basit polinom uydurma)
+                if len(exp) >= 3:
+                    try:
+                        # 2. derece polinom fit (smoothing için)
+                        sort_idx = np.argsort(exp)
+                        x_sorted = np.array(exp)[sort_idx]
+                        y_sorted = np.array(obs)[sort_idx]
+                        coefs = np.polyfit(x_sorted, y_sorted, deg=min(2, len(exp)-1))
+                        x_smooth = np.linspace(0, 1, 100)
+                        y_smooth = np.polyval(coefs, x_smooth)
+                        y_smooth = np.clip(y_smooth, 0, 1)
+                        ax_cal.plot(x_smooth, y_smooth, color='#E07A5F',
+                                     lw=2, alpha=0.8, label='Lowess fit')
+                    except Exception:
+                        pass
+
+                ax_cal.set_xlim(-0.02, 1.02)
+                ax_cal.set_ylim(-0.02, 1.02)
+                ax_cal.set_xlabel("Tahmin edilen olasılık", fontsize=12)
+                ax_cal.set_ylabel("Gözlenen olasılık", fontsize=12)
+                ax_cal.set_title(
+                    f"Kalibrasyon Eğrisi\n"
+                    f"Hosmer-Lemeshow χ² = {hl_stat:.2f}, p = {fmt_p(hl_p)} · "
+                    f"Brier = {brier:.3f}",
+                    fontsize=12
+                )
+                ax_cal.legend(loc='upper left', fontsize=10)
+                ax_cal.grid(alpha=0.3)
+                ax_cal.set_aspect('equal')
+                plt.tight_layout()
+                st.pyplot(fig_cal)
+
+                # Yorumlama
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Hosmer-Lemeshow p", fmt_p(hl_p),
+                            "İyi kalibrasyon" if hl_p > 0.05 else "Sapma var")
+                c2.metric("Brier Skoru", f"{brier:.3f}",
+                            "İyi" if brier < 0.20 else ("Orta" if brier < 0.25 else "Zayıf"))
+                c3.metric("Decile sayısı", str(len(cal_data)))
+
+                # Detaylı tablo
+                with st.expander("📋 Kalibrasyon tablosu (decile bazlı)"):
+                    cal_df = pd.DataFrame(cal_data)
+                    cal_df['observed'] = cal_df['observed'].apply(lambda x: f"{x:.3f}")
+                    cal_df['expected'] = cal_df['expected'].apply(lambda x: f"{x:.3f}")
+                    cal_df['exp_count'] = cal_df['exp_count'].apply(lambda x: f"{x:.2f}")
+                    cal_df.columns = ['Decile', 'n', 'Gözlenen oran',
+                                       'Beklenen oran', 'Gözlenen sayı', 'Beklenen sayı']
+                    st.dataframe(cal_df, use_container_width=True)
+
+                # PNG indirme
+                buf = io.BytesIO()
+                fig_cal.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+                st.download_button("📥 Kalibrasyon eğrisini PNG indir",
+                                    buf.getvalue(), "calibration.png", "image/png")
+
+            except Exception as e:
+                st.warning(f"Kalibrasyon hesaplanamadı: {e}")
+
+            # ─── BOOTSTRAP İÇ VALİDASYON (Harrell yöntemi) ───
+            st.markdown("---")
+            st.markdown("### 🔄 Bootstrap İç Validasyon — Optimism-Corrected AUC")
+            with st.expander("ℹ️ Bootstrap iç validasyon nedir?"):
+                st.markdown("""
+                Modelin **overfitting** miktarını ölçer. Harici (dış) validasyon yapılamadığında
+                Harrell (1996) tarafından önerilen standart yöntemdir.
+
+                **Adımlar:**
+                1. Orijinal veriden AUC hesapla → **AUC_app** (apparent)
+                2. B kez bootstrap örneklem al (yerine koyarak), her birinde:
+                   - Bootstrap'tan yeni model fit et → AUC_boot
+                   - Aynı modeli **orijinal veride** test et → AUC_test
+                   - Optimizm = AUC_boot − AUC_test
+                3. **Düzeltilmiş AUC = AUC_app − ortalama(optimizm)**
+
+                Makalede: *"Internal validation was performed using 1000 bootstrap resamples
+                with the optimism-corrected AUC reported."*
+                """)
+
+            cbb1, cbb2 = st.columns([1, 3])
+            with cbb1:
+                n_boot = st.selectbox(
+                    "Bootstrap sayısı",
+                    [100, 200, 500, 1000, 2000],
+                    index=3,
+                    help="1000 standart, 2000 daha kararlı; süre ~30 sn"
+                )
+            with cbb2:
+                run_boot = st.button("▶ Bootstrap iç validasyon çalıştır",
+                                       type="primary")
+
+            if run_boot:
+                try:
+                    progress = st.progress(0, text="Bootstrap çalışıyor...")
+                    rng_boot = np.random.default_rng(42)
+                    X_arr = X_lr_const.values
+                    y_arr = y_lr.values
+                    n = len(y_arr)
+
+                    # Apparent AUC
+                    fpr_app, tpr_app, _ = roc_curve(y_arr, pred_full)
+                    auc_app = auc(fpr_app, tpr_app)
+
+                    optimism_list = []
+                    boot_aucs = []
+                    test_aucs = []
+
+                    for b in range(n_boot):
+                        # Bootstrap örneklem (yerine koyarak)
+                        idx_b = rng_boot.choice(n, size=n, replace=True)
+                        X_b = X_arr[idx_b]; y_b = y_arr[idx_b]
+
+                        # Bootstrap'ta tek sınıf çıkarsa atla
+                        if len(np.unique(y_b)) < 2: continue
+
+                        # Bootstrap model fit
+                        try:
+                            if use_firth:
+                                fr = firth_logistic_regression(X_b, y_b, max_iter=100)
+                                beta_b = fr['beta']
+                            else:
+                                # Hızlı standart logistic via statsmodels
+                                mb = sm.Logit(y_b, X_b).fit(disp=False, maxiter=100,
+                                                                method='newton')
+                                beta_b = mb.params.values
+
+                            # AUC_boot (bootstrap verisinde)
+                            pred_b_on_b = 1/(1+np.exp(-np.clip(X_b @ beta_b, -30, 30)))
+                            fpr_b, tpr_b, _ = roc_curve(y_b, pred_b_on_b)
+                            auc_b = auc(fpr_b, tpr_b)
+
+                            # AUC_test (orijinal veride)
+                            pred_b_on_orig = 1/(1+np.exp(-np.clip(X_arr @ beta_b, -30, 30)))
+                            fpr_t, tpr_t, _ = roc_curve(y_arr, pred_b_on_orig)
+                            auc_t = auc(fpr_t, tpr_t)
+
+                            boot_aucs.append(auc_b)
+                            test_aucs.append(auc_t)
+                            optimism_list.append(auc_b - auc_t)
+                        except Exception:
+                            continue
+
+                        if (b+1) % max(1, n_boot//20) == 0:
+                            progress.progress((b+1)/n_boot,
+                                                 text=f"Bootstrap: {b+1}/{n_boot}")
+
+                    progress.empty()
+
+                    if len(optimism_list) < 10:
+                        st.error("Yeterli başarılı bootstrap iterasyonu yok.")
+                    else:
+                        mean_opt = np.mean(optimism_list)
+                        auc_corrected = auc_app - mean_opt
+                        # %95 CI: bootstrap distribution dan
+                        ci_lo_opt = np.percentile(optimism_list, 2.5)
+                        ci_hi_opt = np.percentile(optimism_list, 97.5)
+                        auc_ci_lo = auc_app - ci_hi_opt
+                        auc_ci_hi = auc_app - ci_lo_opt
+
+                        # Sonuçlar
+                        st.markdown("#### 📈 Sonuçlar")
+                        bc1, bc2, bc3, bc4 = st.columns(4)
+                        bc1.metric("Apparent AUC", f"{auc_app:.4f}")
+                        bc2.metric("Ortalama Optimizm",
+                                     f"{mean_opt:+.4f}",
+                                     f"%{mean_opt*100:.2f}")
+                        bc3.metric("Düzeltilmiş AUC",
+                                     f"{auc_corrected:.4f}",
+                                     f"Δ {-mean_opt:+.4f}",
+                                     delta_color="inverse")
+                        bc4.metric("95% CI (düzeltilmiş)",
+                                     f"[{auc_ci_lo:.3f}, {auc_ci_hi:.3f}]")
+
+                        # Yorum
+                        if mean_opt < 0.02:
+                            st.success(
+                                f"✅ Optimizm çok düşük ({mean_opt:+.3f}). "
+                                "Model overfitting göstermiyor, düzeltilmiş performans "
+                                "apparent ile neredeyse aynı."
+                            )
+                        elif mean_opt < 0.05:
+                            st.info(
+                                f"ℹ️ Hafif optimizm var ({mean_opt:+.3f}). "
+                                "Düzeltilmiş AUC daha güvenilir bir tahmin."
+                            )
+                        else:
+                            st.warning(
+                                f"⚠️ Belirgin optimizm ({mean_opt:+.3f}). "
+                                "Model overfitting gösteriyor olabilir; düzeltilmiş "
+                                "değer rapor edilmeli."
+                            )
+
+                        # Histogram + apparent vs corrected
+                        fig_b, axes_b = plt.subplots(1, 2, figsize=(13, 5))
+
+                        # Sol: AUC dağılımları
+                        axes_b[0].hist(boot_aucs, bins=30, alpha=0.6,
+                                          color='#2E86AB', label='AUC_boot (bootstrap)',
+                                          edgecolor='white')
+                        axes_b[0].hist(test_aucs, bins=30, alpha=0.6,
+                                          color='#E07A5F', label='AUC_test (orijinal)',
+                                          edgecolor='white')
+                        axes_b[0].axvline(auc_app, color='black', lw=2,
+                                             linestyle='--', label=f'Apparent = {auc_app:.3f}')
+                        axes_b[0].axvline(auc_corrected, color='#A23B72', lw=2,
+                                             label=f'Düzeltilmiş = {auc_corrected:.3f}')
+                        axes_b[0].set_xlabel("AUC", fontsize=11)
+                        axes_b[0].set_ylabel("Frekans", fontsize=11)
+                        axes_b[0].set_title("Bootstrap AUC Dağılımı")
+                        axes_b[0].legend(loc='upper left', fontsize=9)
+                        axes_b[0].grid(alpha=0.3)
+
+                        # Sağ: Optimizm dağılımı
+                        axes_b[1].hist(optimism_list, bins=30, color='#F18F01',
+                                          alpha=0.7, edgecolor='white')
+                        axes_b[1].axvline(mean_opt, color='red', lw=2,
+                                             label=f'Ortalama = {mean_opt:+.4f}')
+                        axes_b[1].axvline(0, color='black', lw=1, alpha=0.5)
+                        axes_b[1].set_xlabel("Optimizm (AUC_boot − AUC_test)",
+                                                fontsize=11)
+                        axes_b[1].set_ylabel("Frekans", fontsize=11)
+                        axes_b[1].set_title(f"Optimizm Dağılımı (n = {len(optimism_list)} bootstrap)")
+                        axes_b[1].legend(fontsize=10)
+                        axes_b[1].grid(alpha=0.3)
+
+                        plt.tight_layout()
+                        st.pyplot(fig_b)
+
+                        # PNG indirme
+                        buf = io.BytesIO()
+                        fig_b.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+                        st.download_button("📥 Bootstrap grafiklerini PNG indir",
+                                            buf.getvalue(), "bootstrap.png", "image/png")
+
+                        # Makaleye yazılacak cümle örneği
+                        st.info(
+                            f"📝 **Makaleye yazılacak cümle:**\n\n"
+                            f"*\"Internal validation was performed using {n_boot} bootstrap "
+                            f"resamples. The apparent AUC was {auc_app:.3f}, with a mean "
+                            f"optimism of {mean_opt:+.3f}, yielding an optimism-corrected "
+                            f"AUC of {auc_corrected:.3f} (95% CI: {auc_ci_lo:.3f}–{auc_ci_hi:.3f}).\"*"
+                        )
+
+                except Exception as e:
+                    st.error(f"Bootstrap çalıştırılamadı: {e}")
+                    st.exception(e)
+
             # ─── İNTERAKTİF RİSK HESAPLAYICI ───
             st.markdown("---")
             st.markdown("### 🧮 İnteraktif Risk Hesaplayıcı")
