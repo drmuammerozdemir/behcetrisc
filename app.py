@@ -101,6 +101,32 @@ MODELS = {
         "sens": 84.3,
         "spec": 85.6
     },
+    "SIRI + Yaş + Hastalık Süresi": {
+        "auc": 0.921,
+        "intercept": -6.259187,
+        "coefs": {
+            "SIRI": 5.034701,
+            "YAŞ": 0.002450,
+            "HASTALIK SÜRESİ": 0.013674
+        },
+        "description": "Yaş ve hastalık süresi düzeltmesi içerir",
+        "cutoff": None,
+        "sens": None,
+        "spec": None
+    },
+    "AISI + Yaş + Hastalık Süresi": {
+        "auc": 0.916,
+        "intercept": -4.912675,
+        "coefs": {
+            "AISI": 0.013636,
+            "YAŞ": -0.000396,
+            "HASTALIK SÜRESİ": 0.018977
+        },
+        "description": "Yaş ve hastalık süresi düzeltmesi içerir",
+        "cutoff": None,
+        "sens": None,
+        "spec": None
+    },
 }
 
 # ====== BAŞLIK ======
@@ -119,7 +145,8 @@ with st.expander("ℹ️ Hesaplayıcı hakkında"):
     **Kullanım:**
     1. Modeli seçin (SIRI önerilen)
     2. Hastanın hemogram değerlerini girin
-    3. Otomatik hesaplanan olasılığı okuyun
+    3. Düzeltilmiş model seçildiyse yaş ve hastalık süresini de girin
+    4. Otomatik hesaplanan olasılığı okuyun
 
     **Eğitim verisi:** Yalnızca Behçet tanısı olan hastalardır.
     Bu hesaplayıcı **Behçet'i tanımlamaz** — hastalığın komplike olup
@@ -179,8 +206,24 @@ ic1, ic2 = st.columns(2)
 ic1.metric("SIRI", f"{siri:.2f}")
 ic2.metric("AISI", f"{aisi:.0f}")
 
+# Eğer seçili model yaş/süre istiyorsa, ek alanları göster
+extra_vars = {}
+needs_extra = any(k in model['coefs'] for k in ['YAŞ', 'HASTALIK SÜRESİ'])
+if needs_extra:
+    st.markdown("#### Ek Klinik Değişkenler")
+    e1, e2 = st.columns(2)
+    with e1:
+        extra_vars['YAŞ'] = st.number_input("Yaş", min_value=15, max_value=90,
+                                             value=40, step=1, help="yıl")
+    with e2:
+        extra_vars['HASTALIK SÜRESİ'] = st.number_input(
+            "Hastalık Süresi", min_value=0, max_value=50,
+            value=5, step=1, help="yıl (tanıdan itibaren)"
+        )
+
 # ====== HESAPLAMA ======
 all_indices = {'SIRI': siri, 'AISI': aisi}
+all_indices.update(extra_vars)
 
 logit = model['intercept']
 for var, coef in model['coefs'].items():
