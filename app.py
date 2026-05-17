@@ -1,323 +1,1570 @@
 # -*- coding: utf-8 -*-
 """
-Behçet Risk Hesaplayıcı — Standalone Web Uygulaması
-======================================================
-Komplike Behçet (Vaskülit ± Üveit) için risk tahmini.
+Behçet Hastalığı Klinik İstatistik Paneli v2.0
+==================================================
+Saf Mukokutanöz vs. Komplike Behçet (Vaskülit / Üveit) Analizi
 
-Bu uygulama, 180 hastalık bir kohortta türetilen lojistik regresyon
-modellerine dayanır. Saf mukokutanöz vs komplike Behçet ayrımı için
-tasarlanmıştır.
-
-Deploy etmek için:
-  - Streamlit Cloud'a yükle: https://share.streamlit.io
-  - Veya: streamlit run risk_calculator.py
+Özellikler:
+ - Grup bazlı normallik (Shapiro-Wilk her grupta ayrı)
+ - Varyans homojenliği (Levene), gerekirse Welch t/ANOVA
+ - Post-hoc: Tukey HSD (parametrik) veya Dunn (non-parametrik)
+ - Çoklu karşılaştırma düzeltmesi: Benjamini-Hochberg (FDR)
+ - Etki büyüklükleri: Cohen's d, rank-biserial r
+ - Hem Mean±SD hem Median (IQR) raporlama
+ - Tablo 1 (demografik) + Tablo 2 (biyomarker)
+ - Strip plot + anlamlılık parantezleri (Figure 1 tarzı)
+ - Spearman korelasyon heatmap (Figure 3 tarzı)
+ - Çoklu ROC eğrisi + AUC + optimal cut-off (Youden J)
 """
 
 import streamlit as st
+import pandas as pd
 import numpy as np
 import math
+from scipy import stats
+import matplotlib.pyplot as plt
+import seaborn as sns
+import io
+
+# Opsiyonel paketler (kullanıcının yüklemesi gerekir):
+try:
+    import scikit_posthocs as sp
+    HAS_POSTHOC = True
+except ImportError:
+    HAS_POSTHOC = False
+
+try:
+    from statsmodels.stats.multitest import multipletests
+    from statsmodels.stats.multicomp import pairwise_tukeyhsd
+    from statsmodels.stats.oneway import anova_oneway
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
+
+try:
+    from sklearn.metrics import roc_curve, auc
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+
+# Firth logistic regression — manuel implementasyon
+# Firth (1993): Bias reduction in maximum likelihood estimates
+# Jeffreys prior ile penalize edilmiş log-likelihood
+HAS_FIRTH = True
+
+def firth_logistic_regression(X, y, max_iter=100, tol=1e-6):
+    """
+    Firth penalized logistic regression.
+
+    Parameters
+    ----------
+    X : ndarray (n, p) — design matrix (constant DAHİL)
+    y : ndarray (n,)   — binary outcome
+    max_iter, tol      — yakınsama parametreleri
+
+    Returns
+    -------
+    dict: beta, se, ci_lo, ci_hi, pvals, loglik, fitted_prob
+    """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n, p = X.shape
+    beta = np.zeros(p)
+
+    for it in range(max_iter):
+        eta = X @ beta
+        # Sayısal stabilite için clip
+        eta = np.clip(eta, -30, 30)
+        mu = 1.0 / (1.0 + np.exp(-eta))
+        W = mu * (1 - mu)
+        # Fisher information
+        WX = X * W[:, None]
+        I = X.T @ WX
+        # Inverse (regularize a bit if singular)
+        try:
+            I_inv = np.linalg.inv(I)
+        except np.linalg.LinAlgError:
+            I_inv = np.linalg.pinv(I)
+        # Hat matrix diagonal: H_ii = W_i * x_i^T I^-1 x_i
+        H_diag = np.einsum('ij,jk,ik->i', WX, I_inv, X)
+        # Firth-corrected score
+        U = X.T @ (y - mu + H_diag * (0.5 - mu))
+        # Update
+        delta = I_inv @ U
+        beta_new = beta + delta
+        if np.max(np.abs(delta)) < tol:
+            beta = beta_new
+            break
+        beta = beta_new
+
+    # Standart hatalar (penalized info matrix'in inversi)
+    eta = np.clip(X @ beta, -30, 30)
+    mu = 1.0 / (1.0 + np.exp(-eta))
+    W = mu * (1 - mu)
+    I = X.T @ (X * W[:, None])
+    try:
+        I_inv = np.linalg.inv(I)
+    except np.linalg.LinAlgError:
+        I_inv = np.linalg.pinv(I)
+    se = np.sqrt(np.maximum(np.diag(I_inv), 0))
+    # Wald CI ve p-değerleri
+    z = beta / np.where(se > 0, se, np.nan)
+    pvals = 2 * (1 - stats.norm.cdf(np.abs(z)))
+    ci_lo = beta - 1.96 * se
+    ci_hi = beta + 1.96 * se
+    # Penalized log-likelihood
+    eps = 1e-12
+    ll = np.sum(y * np.log(mu + eps) + (1-y) * np.log(1 - mu + eps))
+    # Jeffreys penalty: 0.5 * log|I|
+    try:
+        sign, logdet = np.linalg.slogdet(I)
+        ll_pen = ll + 0.5 * logdet
+    except Exception:
+        ll_pen = ll
+    return {
+        'beta': beta, 'se': se,
+        'ci_lo': ci_lo, 'ci_hi': ci_hi,
+        'pvals': pvals,
+        'loglik': ll, 'loglik_pen': ll_pen,
+        'fitted_prob': mu
+    }
 
 # ====== SAYFA AYARLARI ======
-st.set_page_config(
-    page_title="Behçet Risk Hesaplayıcı",
-    page_icon="🩺",
-    layout="centered",
-    initial_sidebar_state="collapsed"
+st.set_page_config(page_title="Behçet İstatistik Paneli v2", layout="wide")
+st.title("🩺 Behçet Hastalığı: Klinik Veri Analiz Paneli v2.0")
+st.caption("Saf Mukokutanöz Behçet vs. Komplike Behçet (Vaskülit ± Üveit)")
+
+# Uyarı: paket eksikse
+missing = []
+if not HAS_POSTHOC: missing.append("scikit-posthocs")
+if not HAS_STATSMODELS: missing.append("statsmodels")
+if not HAS_SKLEARN: missing.append("scikit-learn")
+if missing:
+    st.warning(f"Eksik paketler: `{', '.join(missing)}`. Kurmak için: `pip install {' '.join(missing)}`")
+
+# ====== YARDIMCI FONKSİYONLAR ======
+
+def cohens_d(g1, g2):
+    """Bağımsız iki grup için Cohen's d (pooled SD)."""
+    g1, g2 = np.asarray(g1), np.asarray(g2)
+    n1, n2 = len(g1), len(g2)
+    if n1 < 2 or n2 < 2: return np.nan
+    v1, v2 = np.var(g1, ddof=1), np.var(g2, ddof=1)
+    pooled = np.sqrt(((n1-1)*v1 + (n2-1)*v2) / (n1+n2-2))
+    return (np.mean(g1) - np.mean(g2)) / pooled if pooled > 0 else np.nan
+
+def rank_biserial_r(g1, g2):
+    """Mann-Whitney U için etki büyüklüğü (rank-biserial korelasyon)."""
+    g1, g2 = np.asarray(g1), np.asarray(g2)
+    n1, n2 = len(g1), len(g2)
+    if n1 < 2 or n2 < 2: return np.nan
+    try:
+        u, _ = stats.mannwhitneyu(g1, g2, alternative='two-sided')
+        return 1 - (2*u) / (n1*n2)
+    except ValueError:
+        return np.nan
+
+def fmt_p(p):
+    if pd.isna(p): return "—"
+    if p < 0.001: return "<0.001"
+    return f"{p:.3f}"
+
+def fmt_descr(data, mode='auto', is_normal=True):
+    """Tanımlayıcı istatistik. mode: 'mean', 'median', 'auto' (dağılıma göre)."""
+    data = np.asarray(data)
+    data = data[~np.isnan(data)]
+    if len(data) == 0: return "—"
+    if mode == 'auto':
+        mode = 'mean' if is_normal else 'median'
+    if mode == 'mean':
+        sd = np.std(data, ddof=1) if len(data) > 1 else 0
+        return f"{np.mean(data):.2f} ± {sd:.2f}"
+    else:
+        q1, q3 = np.percentile(data, [25, 75])
+        return f"{np.median(data):.2f} [{q1:.2f}–{q3:.2f}]"
+
+def shapiro_per_group(df, col, group_col):
+    """Her grupta Shapiro-Wilk; herhangi biri p<0.05 ise dağılım non-normal."""
+    p_vals = {}
+    for g in df[group_col].dropna().unique():
+        d = df[df[group_col]==g][col].dropna()
+        if len(d) >= 3:
+            try:
+                _, p = stats.shapiro(d)
+                p_vals[g] = p
+            except Exception:
+                p_vals[g] = np.nan
+    if not p_vals:
+        return False, {}
+    valid = [p for p in p_vals.values() if not pd.isna(p)]
+    is_normal = (min(valid) > 0.05) if valid else False
+    return is_normal, p_vals
+
+def levene_test(*groups):
+    """Levene testi (median-bazlı, daha robust)."""
+    valid_groups = [np.asarray(g)[~np.isnan(g)] for g in groups]
+    valid_groups = [g for g in valid_groups if len(g) >= 2]
+    if len(valid_groups) < 2:
+        return np.nan, np.nan
+    try:
+        return stats.levene(*valid_groups, center='median')
+    except Exception:
+        return np.nan, np.nan
+
+def add_significance_bracket(ax, x1, x2, y, p_value, h=0.02):
+    """Strip/box plot üzerine anlamlılık paranteziekler."""
+    if pd.isna(p_value) or p_value >= 0.05:
+        return
+    if p_value < 0.001: label = "p < 0.001"
+    elif p_value < 0.01: label = f"p = {p_value:.3f}"
+    else: label = f"p = {p_value:.3f}"
+    ax.plot([x1, x1, x2, x2], [y, y+h, y+h, y], lw=1.2, c='black')
+    ax.text((x1+x2)/2, y+h, label, ha='center', va='bottom', fontsize=10)
+
+
+# ====== DELONG TESTİ (iki bağımlı ROC eğrisinin karşılaştırılması) ======
+# DeLong, DeLong & Clarke-Pearson (1988); Sun & Xu (2014) hızlı algoritma
+def _compute_midrank(x):
+    """Bağlı gözlemler için midrank (DeLong yardımcı fonksiyonu)."""
+    J = np.argsort(x)
+    Z = x[J]
+    N = len(x)
+    T = np.zeros(N, dtype=np.float64)
+    i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        T[i:j] = 0.5 * (i + j - 1) + 1
+        i = j
+    T2 = np.empty(N, dtype=np.float64)
+    T2[J] = T
+    return T2
+
+def _fast_delong(predictions, label_1_count):
+    """Hızlı DeLong kovaryans hesaplama."""
+    m = label_1_count
+    n = predictions.shape[1] - m
+    pos = predictions[:, :m]
+    neg = predictions[:, m:]
+    k = predictions.shape[0]
+    tx = np.empty([k, m]); ty = np.empty([k, n]); tz = np.empty([k, m+n])
+    for r in range(k):
+        tx[r] = _compute_midrank(pos[r])
+        ty[r] = _compute_midrank(neg[r])
+        tz[r] = _compute_midrank(predictions[r])
+    aucs = tz[:, :m].sum(axis=1) / m / n - (m + 1.0) / 2.0 / n
+    v01 = (tz[:, :m] - tx) / n
+    v10 = 1.0 - (tz[:, m:] - ty) / m
+    if k > 1:
+        sx = np.cov(v01); sy = np.cov(v10)
+    else:
+        sx = np.array([[np.var(v01.flatten(), ddof=1)]])
+        sy = np.array([[np.var(v10.flatten(), ddof=1)]])
+    delong_cov = sx / m + sy / n
+    return aucs, delong_cov
+
+def delong_test(y_true, score1, score2):
+    """
+    DeLong testi: iki bağımlı ROC eğrisinin AUC'lerini karşılaştırır.
+    Aynı hastalar üzerinde iki farklı belirteç için.
+    Returns: (auc1, auc2, z, p)
+    """
+    y_true = np.asarray(y_true).astype(int)
+    score1 = np.asarray(score1, dtype=float)
+    score2 = np.asarray(score2, dtype=float)
+    order = np.argsort(-y_true)  # pozitifler önce
+    label_1_count = int(y_true.sum())
+    preds = np.vstack((score1[order], score2[order]))
+    aucs, cov = _fast_delong(preds, label_1_count)
+    l = np.array([[1, -1]])
+    var = float((l @ cov @ l.T).item())
+    if var <= 0:
+        return float(aucs[0]), float(aucs[1]), np.nan, np.nan
+    z = (aucs[0] - aucs[1]) / np.sqrt(var)
+    p = 2 * (1 - stats.norm.cdf(abs(z)))
+    return float(aucs[0]), float(aucs[1]), float(z), float(p)
+
+def effective_scores(y_true, raw_scores):
+    """AUC<0.5 olduğunda skorları ters çevirir (LENFOSİT gibi inverse prediktörler için)."""
+    if not HAS_SKLEARN:
+        return raw_scores
+    fpr, tpr, _ = roc_curve(y_true, raw_scores)
+    return -np.asarray(raw_scores) if auc(fpr, tpr) < 0.5 else np.asarray(raw_scores)
+
+
+# ====== DOSYA YÜKLEME ======
+uploaded = st.file_uploader(
+    "Veri dosyasını seçin (xlsx, xls, csv, sav)",
+    type=["xlsx", "xls", "csv", "sav"]
 )
 
-# ====== STİL ======
-st.markdown("""
-<style>
-    .main-title {
-        font-size: 2.2rem;
-        font-weight: 700;
-        color: #1a4d5c;
-        margin-bottom: 0.2rem;
-    }
-    .subtitle {
-        font-size: 1rem;
-        color: #5a7684;
-        margin-bottom: 1.5rem;
-        font-style: italic;
-    }
-    .result-box {
-        padding: 1.5rem;
-        border-radius: 12px;
-        text-align: center;
-        margin: 1rem 0;
-    }
-    .risk-low { background: linear-gradient(135deg, #d4f1d4 0%, #b8e6b8 100%); border-left: 6px solid #4caf50; }
-    .risk-mid { background: linear-gradient(135deg, #fff4d4 0%, #ffe9a8 100%); border-left: 6px solid #ff9800; }
-    .risk-high { background: linear-gradient(135deg, #ffd4d4 0%, #ffb8b8 100%); border-left: 6px solid #d32f2f; }
-    .prob-text {
-        font-size: 3.5rem;
-        font-weight: 700;
-        color: #1a4d5c;
-        line-height: 1;
-    }
-    .risk-label {
-        font-size: 1.2rem;
-        font-weight: 600;
-        margin-top: 0.5rem;
-    }
-    .info-box {
-        background: #f0f7f9;
-        border-left: 4px solid #1a4d5c;
-        padding: 0.8rem 1rem;
-        border-radius: 6px;
-        margin: 0.8rem 0;
-        font-size: 0.9rem;
-    }
-    .disclaimer {
-        background: #fff3e0;
-        border-left: 4px solid #e65100;
-        padding: 1rem;
-        border-radius: 6px;
-        margin-top: 2rem;
-        font-size: 0.85rem;
-        color: #5d4037;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# ====== MODEL KATSAYILARI (180 hastalık kohorttan türetilen) ======
-# Lojistik regresyon: P(Komplike) = 1 / (1 + exp(-(intercept + β·x)))
-MODELS = {
-    "SIRI (önerilen)": {
-        "auc": 0.918,
-        "intercept": -5.987041,
-        "coefs": {"SIRI": 5.075754},
-        "description": "En yüksek spesifite (%93.3) — pratik klinik kullanım",
-        "cutoff": 1.30,
-        "sens": 74.2,
-        "spec": 93.3
-    },
-    "AISI": {
-        "auc": 0.913,
-        "intercept": -4.696455,
-        "coefs": {"AISI": 0.013837},
-        "description": "En yüksek Youden J — sensitivite-spesifite dengesi",
-        "cutoff": 322.51,
-        "sens": 84.3,
-        "spec": 85.6
-    },
-    "SIRI + Yaş + Hastalık Süresi": {
-        "auc": 0.921,
-        "intercept": -6.259187,
-        "coefs": {
-            "SIRI": 5.034701,
-            "YAŞ": 0.002450,
-            "HASTALIK SÜRESİ": 0.013674
-        },
-        "description": "Yaş ve hastalık süresi düzeltmesi içerir",
-        "cutoff": None,
-        "sens": None,
-        "spec": None
-    },
-    "AISI + Yaş + Hastalık Süresi": {
-        "auc": 0.916,
-        "intercept": -4.912675,
-        "coefs": {
-            "AISI": 0.013636,
-            "YAŞ": -0.000396,
-            "HASTALIK SÜRESİ": 0.018977
-        },
-        "description": "Yaş ve hastalık süresi düzeltmesi içerir",
-        "cutoff": None,
-        "sens": None,
-        "spec": None
-    },
-}
-
-# ====== BAŞLIK ======
-st.markdown('<div class="main-title">🩺 Behçet Risk Hesaplayıcı</div>',
-            unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Komplike Behçet Hastalığı (Vaskülit / Üveit) Olasılık Tahmini</div>',
-            unsafe_allow_html=True)
-
-with st.expander("ℹ️ Hesaplayıcı hakkında"):
-    st.markdown("""
-    Bu hesaplayıcı, **180 hastalık tek merkezli bir kohorttan** türetilen
-    lojistik regresyon modellerine dayanır. **Saf mukokutanöz Behçet** ile
-    **komplike Behçet** (vaskülit ve/veya üveit tutulumu olan) hastaları
-    ayırt etmek için tasarlanmıştır.
-
-    **Kullanım:**
-    1. Modeli seçin (SIRI önerilen)
-    2. Hastanın hemogram değerlerini girin
-    3. Düzeltilmiş model seçildiyse yaş ve hastalık süresini de girin
-    4. Otomatik hesaplanan olasılığı okuyun
-
-    **Eğitim verisi:** Yalnızca Behçet tanısı olan hastalardır.
-    Bu hesaplayıcı **Behçet'i tanımlamaz** — hastalığın komplike olup
-    olmadığını tahmin eder.
-    """)
-
-# ====== GİRİŞ ALANLARI ======
-col_left, col_right = st.columns([1, 1])
-
-with col_left:
-    st.markdown("### Model Seçimi")
-    model_name = st.selectbox(
-        "Hangi modeli kullanmak istersiniz?",
-        list(MODELS.keys()),
-        help="SIRI en yüksek spesifite sağlar. AISI sensitivite-spesifite dengesinde en iyisidir."
-    )
-    model = MODELS[model_name]
-
-    st.markdown(f"""
-    <div class="info-box">
-    <b>Model performansı:</b><br>
-    AUC = <b>{model['auc']:.3f}</b><br>
-    {model['description']}
-    </div>
-    """, unsafe_allow_html=True)
-
-st.markdown("---")
-st.markdown("### Hasta Verileri")
-st.caption("Hemogram değerlerini girin (×10³/µL hücre sayıları, PLT için ×10³/µL)")
-
-# Hücre sayıları her zaman istenir
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    neu = st.number_input("Nötrofil (NEU)", min_value=0.0, max_value=30.0,
-                          value=4.5, step=0.1, help="×10³/µL")
-with c2:
-    lymph = st.number_input("Lenfosit (LYMPH)", min_value=0.1, max_value=10.0,
-                            value=2.0, step=0.1, help="×10³/µL — 0 olamaz")
-with c3:
-    mono = st.number_input("Monosit (MONO)", min_value=0.0, max_value=3.0,
-                           value=0.5, step=0.01, help="×10³/µL")
-with c4:
-    plt_val = st.number_input("Trombosit (PLT)", min_value=50, max_value=1000,
-                              value=280, step=10, help="×10³/µL")
-
-# İndeksleri hesapla
-try:
-    siri = (neu * mono) / lymph
-    aisi = (plt_val * neu * mono) / lymph
-except ZeroDivisionError:
-    st.error("Lenfosit 0 olamaz.")
+if not uploaded:
+    st.info("Lütfen bir veri dosyası yükleyin.")
     st.stop()
 
-# Hesaplanan indeksleri göster (sadece kullandığımız iki indeks)
-st.markdown("#### Hesaplanan İnflamatuar İndeksler")
-ic1, ic2 = st.columns(2)
-ic1.metric("SIRI", f"{siri:.2f}")
-ic2.metric("AISI", f"{aisi:.0f}")
+@st.cache_data
+def load_data(file, ext):
+    if ext == 'csv':
+        return pd.read_csv(file)
+    elif ext == 'sav':
+        import pyreadstat
+        df, _ = pyreadstat.read_sav(file)
+        return df
+    else:
+        return pd.read_excel(file)
 
-# Eğer seçili model yaş/süre istiyorsa, ek alanları göster
-extra_vars = {}
-needs_extra = any(k in model['coefs'] for k in ['YAŞ', 'HASTALIK SÜRESİ'])
-if needs_extra:
-    st.markdown("#### Ek Klinik Değişkenler")
-    e1, e2 = st.columns(2)
-    with e1:
-        extra_vars['YAŞ'] = st.number_input("Yaş", min_value=15, max_value=90,
-                                             value=40, step=1, help="yıl")
-    with e2:
-        extra_vars['HASTALIK SÜRESİ'] = st.number_input(
-            "Hastalık Süresi", min_value=0, max_value=50,
-            value=5, step=1, help="yıl (tanıdan itibaren)"
+ext = uploaded.name.split('.')[-1].lower()
+try:
+    df = load_data(uploaded, ext)
+except Exception as e:
+    st.error(f"Dosya okunamadı: {e}")
+    st.stop()
+
+# Sütun adlarını temizle
+df.columns = df.columns.str.strip()
+
+# Sayısal dönüşüm
+numeric_cols = ['SEDİM', 'CRP', 'NEU', 'PLT', 'LENFOSİT', 'MONOSİT',
+                'YAŞ', 'HASTALIK SÜRESİ(yıl)', 'Kolşisin', 'Biyolojik',
+                'DMARD', 'VASKÜLİT', 'UVEİT']
+for c in numeric_cols:
+    if c in df.columns:
+        df[c] = pd.to_numeric(
+            df[c].astype(str).str.replace(',', '.'),
+            errors='coerce'
         )
 
-# ====== HESAPLAMA ======
-all_indices = {'SIRI': siri, 'AISI': aisi}
-all_indices.update(extra_vars)
+# SIRI / SII hesapla (mevcut sütunlarla tutarlılık kontrolü)
+if all(c in df.columns for c in ['NEU', 'MONOSİT', 'LENFOSİT']):
+    df['SIRI'] = (df['NEU'] * df['MONOSİT']) / df['LENFOSİT']
+if all(c in df.columns for c in ['NEU', 'PLT', 'LENFOSİT']):
+    df['SII'] = (df['NEU'] * df['PLT']) / df['LENFOSİT']
 
-logit = model['intercept']
-for var, coef in model['coefs'].items():
-    if var in all_indices:
-        logit += coef * all_indices[var]
+# ─── EK İNFLAMATUAR İNDEKSLER ───
+# NLR: Neutrophil-to-Lymphocyte Ratio
+if all(c in df.columns for c in ['NEU', 'LENFOSİT']):
+    df['NLR'] = df['NEU'] / df['LENFOSİT']
+# PLR: Platelet-to-Lymphocyte Ratio
+if all(c in df.columns for c in ['PLT', 'LENFOSİT']):
+    df['PLR'] = df['PLT'] / df['LENFOSİT']
+# NMLR: (Neutrophil + Monocyte) / Lymphocyte
+if all(c in df.columns for c in ['NEU', 'MONOSİT', 'LENFOSİT']):
+    df['NMLR'] = (df['NEU'] + df['MONOSİT']) / df['LENFOSİT']
+# AISI: Aggregate Inflammation Systemic Index = (PLT × NEU × MONO) / LYMPH
+if all(c in df.columns for c in ['NEU', 'PLT', 'MONOSİT', 'LENFOSİT']):
+    df['AISI'] = (df['PLT'] * df['NEU'] * df['MONOSİT']) / df['LENFOSİT']
+
+# Not: dNLR ve dPLR hesaplaması, lökosit (WBC) sayımı gerektirdiğinden
+# bu veride hesaplanmıyor. Veriye WBC sütunu eklenirse manuel olarak hesaplanabilir.
+
+# NaN satırları (VASKÜLİT veya UVEİT eksik olanları) çıkar
+before = len(df)
+df = df.dropna(subset=['VASKÜLİT', 'UVEİT']).reset_index(drop=True)
+dropped = before - len(df)
+
+# ====== GRUP TANIMI: 4 ALT GRUP + İKİLİ ======
+def define_4group(row):
+    v = row['VASKÜLİT'] == 1
+    u = row['UVEİT'] == 1
+    if v and u: return 'Kombine (V+Ü)'
+    elif v:     return 'Sadece Vaskülit'
+    elif u:     return 'Sadece Üveit'
+    else:       return 'Saf Mukokutanöz'
+
+df['Grup'] = df.apply(define_4group, axis=1)
+df['Birlesik_Grup'] = df['Grup'].apply(
+    lambda x: 'Saf Mukokutanöz' if x == 'Saf Mukokutanöz' else 'Komplike Behçet'
+)
+
+# Grup sırası (görsel tutarlılık için)
+GROUP_ORDER_4 = ['Saf Mukokutanöz', 'Sadece Vaskülit', 'Sadece Üveit', 'Kombine (V+Ü)']
+GROUP_ORDER_2 = ['Saf Mukokutanöz', 'Komplike Behçet']
+
+# ====== KENAR ÇUBUĞU ======
+st.sidebar.header("⚙️ Analiz Ayarları")
+
+analysis_mode = st.sidebar.radio(
+    "Karşılaştırma Modu",
+    ["İkili (Komplike vs Saf Mukokutanöz)", "4-Grup Detaylı"],
+    index=0
+)
+
+alpha = st.sidebar.number_input("α (anlamlılık eşiği)", value=0.05,
+                                 min_value=0.001, max_value=0.1, step=0.005)
+
+use_fdr = st.sidebar.checkbox(
+    "Çoklu karşılaştırma düzeltmesi (Benjamini-Hochberg FDR)",
+    value=True
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📊 Grup Dağılımı")
+st.sidebar.write("**4 Alt Grup:**")
+st.sidebar.write(df['Grup'].value_counts().reindex(GROUP_ORDER_4))
+st.sidebar.write("**İkili:**")
+st.sidebar.write(df['Birlesik_Grup'].value_counts().reindex(GROUP_ORDER_2))
+
+if dropped > 0:
+    st.sidebar.warning(f"{dropped} satır eksik VASKÜLİT/UVEİT nedeniyle çıkarıldı.")
+
+# Hedef parametreler — klinik mantıkta sıralı:
+# 1) Akut faz reaktanları → 2) Hücre sayıları → 3) Basit oranlar → 4) Kompozit indeksler
+target_cols = [
+    'SEDİM', 'CRP',                                  # akut faz
+    'NEU', 'PLT', 'LENFOSİT', 'MONOSİT',             # hücre sayıları
+    'NLR', 'PLR',                                    # basit oranlar
+    'NMLR', 'SIRI', 'SII', 'AISI'                    # kompozit indeksler
+]
+target_cols = [c for c in target_cols if c in df.columns]
+
+# Aktif grup kolonu
+group_col = 'Birlesik_Grup' if analysis_mode.startswith("İkili") else 'Grup'
+group_order = GROUP_ORDER_2 if analysis_mode.startswith("İkili") else GROUP_ORDER_4
+
+# ====== SEKMELER ======
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "📋 Veri Önizleme",
+    "👥 Tablo 1: Demografik",
+    "🧪 Tablo 2: Biyomarker",
+    "📈 Strip Plot",
+    "🔥 Korelasyon",
+    "🎯 ROC Analizi",
+    "🔬 Lojistik Regresyon"
+])
+
+# ────────────────────────────────────────────────
+# TAB 1: VERİ ÖNİZLEME
+# ────────────────────────────────────────────────
+with tab1:
+    st.subheader("Veri Önizleme")
+    st.write(f"**Toplam:** {len(df)} hasta, {len(df.columns)} sütun")
+
+    # SIRI/SII tutarlılık
+    orig_siri_col = next((c for c in df.columns if 'SIRI' in c and c != 'SIRI'), None)
+    if orig_siri_col:
+        orig = pd.to_numeric(df[orig_siri_col], errors='coerce')
+        diff = (df['SIRI'] - orig).abs()
+        n_diff = (diff > 0.01).sum()
+        if n_diff > 0:
+            st.warning(f"⚠️ SIRI: {n_diff} satırda orijinalle uyuşmazlık var. Yeniden hesaplanan değerler kullanılıyor.")
+        else:
+            st.success("✅ SIRI değerleri orijinalle tutarlı.")
+
+    st.dataframe(df[['HASTA_ADI', 'YAŞ', 'Grup', 'Birlesik_Grup'] +
+                    [c for c in target_cols if c in df.columns]].head(20))
+
+# ────────────────────────────────────────────────
+# TAB 2: DEMOGRAFİK (TABLO 1)
+# ────────────────────────────────────────────────
+with tab2:
+    st.subheader("Tablo 1 — Demografik ve Klinik Özellikler")
+
+    demo_rows = []
+    demo_continuous = []
+    if 'YAŞ' in df.columns: demo_continuous.append('YAŞ')
+    if 'HASTALIK SÜRESİ(yıl)' in df.columns: demo_continuous.append('HASTALIK SÜRESİ(yıl)')
+
+    for col in demo_continuous:
+        is_normal, _ = shapiro_per_group(df, col, group_col)
+        row = {'Değişken': col, 'Dağılım': 'Normal' if is_normal else 'Non-Normal'}
+        groups_data = []
+        for g in group_order:
+            d = df[df[group_col]==g][col].dropna()
+            row[g] = fmt_descr(d, mode='auto', is_normal=is_normal)
+            groups_data.append(d)
+
+        # Test
+        if len(groups_data) == 2:
+            if is_normal:
+                # Levene → Welch'e geç gerekirse
+                _, p_lev = levene_test(*groups_data)
+                eq_var = (p_lev > 0.05) if not pd.isna(p_lev) else True
+                _, p = stats.ttest_ind(groups_data[0], groups_data[1], equal_var=eq_var)
+                test = "t-test" if eq_var else "Welch t"
+            else:
+                _, p = stats.mannwhitneyu(groups_data[0], groups_data[1])
+                test = "MWU"
+        else:
+            if is_normal:
+                _, p = stats.f_oneway(*groups_data)
+                test = "ANOVA"
+            else:
+                _, p = stats.kruskal(*groups_data)
+                test = "Kruskal-W"
+
+        row['Test'] = test
+        row['p'] = fmt_p(p)
+        demo_rows.append(row)
+
+    # Cinsiyet tahmini (HASTA_ADI'ndan, sadece informatif)
+    # Kategorik: ilaç kullanımı
+    cat_vars = []
+    if 'Kolşisin' in df.columns: cat_vars.append('Kolşisin')
+    if 'Biyolojik' in df.columns: cat_vars.append('Biyolojik')
+    if 'DMARD' in df.columns: cat_vars.append('DMARD')
+
+    for col in cat_vars:
+        row = {'Değişken': col + ' (kullanım, n %)', 'Dağılım': '—'}
+        # Chi-kare
+        try:
+            ct = pd.crosstab(df[col], df[group_col])
+            chi2, p, _, _ = stats.chi2_contingency(ct)
+            test = "χ²"
+        except Exception:
+            p = np.nan
+            test = "—"
+
+        for g in group_order:
+            sub = df[df[group_col]==g][col].dropna()
+            n_pos = int((sub == 1).sum())
+            total = len(sub)
+            pct = (n_pos / total * 100) if total > 0 else 0
+            row[g] = f"{n_pos}/{total} ({pct:.1f}%)"
+
+        row['Test'] = test
+        row['p'] = fmt_p(p)
+        demo_rows.append(row)
+
+    demo_df = pd.DataFrame(demo_rows)
+
+    def hl_p(v):
+        try:
+            if v == "<0.001": return 'background-color: #D4EFDF'
+            return 'background-color: #D4EFDF' if float(v) < alpha else ''
+        except: return ''
+
+    st.dataframe(demo_df.style.map(hl_p, subset=['p']), use_container_width=True)
+
+    csv = demo_df.to_csv(index=False).encode('utf-8-sig')
+    st.download_button("📥 Tablo 1'i CSV olarak indir", csv,
+                       "tablo1_demografik.csv", "text/csv")
+
+# ────────────────────────────────────────────────
+# TAB 3: BİYOMARKER (TABLO 2)
+# ────────────────────────────────────────────────
+with tab3:
+    st.subheader(f"Tablo 2 — İnflamatuar Biyomarker Karşılaştırması ({analysis_mode})")
+
+    summary_rows = []
+    raw_pvals = []  # FDR için
+
+    for col in target_cols:
+        is_normal, shap_pvals = shapiro_per_group(df, col, group_col)
+        groups_data = [df[df[group_col]==g][col].dropna().values for g in group_order]
+
+        # Levene
+        _, p_lev = levene_test(*groups_data)
+        eq_var = (p_lev > 0.05) if not pd.isna(p_lev) else True
+
+        # Omnibus test
+        try:
+            if len(group_order) == 2:
+                if is_normal:
+                    _, p_omni = stats.ttest_ind(groups_data[0], groups_data[1],
+                                                 equal_var=eq_var)
+                    test = "t-test" if eq_var else "Welch t"
+                else:
+                    _, p_omni = stats.mannwhitneyu(groups_data[0], groups_data[1])
+                    test = "MWU"
+            else:
+                if is_normal and eq_var:
+                    _, p_omni = stats.f_oneway(*groups_data)
+                    test = "ANOVA"
+                elif is_normal and not eq_var and HAS_STATSMODELS:
+                    res = anova_oneway(groups_data, use_var='unequal')
+                    p_omni = res.pvalue
+                    test = "Welch ANOVA"
+                else:
+                    _, p_omni = stats.kruskal(*groups_data)
+                    test = "Kruskal-W"
+        except Exception as e:
+            p_omni = np.nan
+            test = "—"
+
+        # Etki büyüklüğü (sadece ikili modda)
+        eff_str = "—"
+        if len(group_order) == 2:
+            mk = df[df[group_col]=='Saf Mukokutanöz'][col].dropna().values
+            kp = df[df[group_col]=='Komplike Behçet'][col].dropna().values
+            if is_normal:
+                d = cohens_d(kp, mk)
+                eff_str = f"d = {d:.2f}" if not pd.isna(d) else "—"
+            else:
+                r = rank_biserial_r(kp, mk)
+                eff_str = f"r = {r:.2f}" if not pd.isna(r) else "—"
+
+        # Trend
+        means = [np.mean(g) if len(g)>0 else np.nan for g in groups_data]
+        if len(means) == 2 and not pd.isna(p_omni) and p_omni < alpha:
+            trend = "↑" if means[1] > means[0] else "↓"
+        else:
+            trend = "↔"
+
+        row = {
+            'Parametre': col,
+            'Dağılım': 'Normal' if is_normal else 'Non-Normal',
+            'Levene p': fmt_p(p_lev),
+        }
+        for i, g in enumerate(group_order):
+            row[g] = fmt_descr(groups_data[i], mode='auto', is_normal=is_normal)
+        row['Test'] = test
+        row['p'] = fmt_p(p_omni)
+        row['Etki'] = eff_str
+        row['Trend'] = trend
+        summary_rows.append(row)
+        raw_pvals.append(p_omni)
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    # FDR düzeltmesi
+    if use_fdr and HAS_STATSMODELS:
+        valid_mask = ~pd.isna(raw_pvals)
+        p_arr = np.array(raw_pvals, dtype=float)
+        p_arr_valid = p_arr[valid_mask]
+        if len(p_arr_valid) > 0:
+            _, p_adj, _, _ = multipletests(p_arr_valid, alpha=alpha, method='fdr_bh')
+            full_adj = np.full_like(p_arr, np.nan, dtype=float)
+            full_adj[valid_mask] = p_adj
+            summary_df['p (FDR)'] = [fmt_p(p) for p in full_adj]
+
+    def hl_p_full(v):
+        try:
+            if v == "<0.001": return 'background-color: #D4EFDF'
+            return 'background-color: #D4EFDF' if float(v) < alpha else ''
+        except: return ''
+
+    cols_to_color = ['p']
+    if 'p (FDR)' in summary_df.columns: cols_to_color.append('p (FDR)')
+
+    st.dataframe(
+        summary_df.style.map(hl_p_full, subset=cols_to_color),
+        use_container_width=True
+    )
+
+    # Post-hoc (sadece 4-grup modunda + anlamlı omnibus)
+    if len(group_order) > 2:
+        st.markdown("---")
+        st.subheader("📐 Post-hoc Analizler")
+        st.caption("Sadece omnibus p < α olan parametreler için ikili karşılaştırma.")
+
+        for i, col in enumerate(target_cols):
+            p_omni = raw_pvals[i]
+            if pd.isna(p_omni) or p_omni >= alpha:
+                continue
+            is_normal = summary_rows[i]['Dağılım'] == 'Normal'
+
+            st.markdown(f"**{col}** (omnibus p = {fmt_p(p_omni)})")
+            sub = df.dropna(subset=[col, group_col])
+
+            if is_normal and HAS_STATSMODELS:
+                tuk = pairwise_tukeyhsd(sub[col], sub[group_col], alpha=alpha)
+                tuk_df = pd.DataFrame(data=tuk._results_table.data[1:],
+                                       columns=tuk._results_table.data[0])
+                st.dataframe(tuk_df)
+            elif not is_normal and HAS_POSTHOC:
+                dunn = sp.posthoc_dunn(sub, val_col=col, group_col=group_col,
+                                        p_adjust='holm')
+                st.dataframe(dunn.style.map(
+                    lambda v: 'background-color: #D4EFDF' if isinstance(v, (int,float)) and v < alpha else ''
+                ))
+            else:
+                st.info("Post-hoc için gerekli paket eksik.")
+
+    csv = summary_df.to_csv(index=False).encode('utf-8-sig')
+    st.download_button("📥 Tablo 2'yi CSV olarak indir", csv,
+                       "tablo2_biyomarker.csv", "text/csv")
+
+# ────────────────────────────────────────────────
+# TAB 4: STRIP PLOT (Figure 1 tarzı)
+# ────────────────────────────────────────────────
+with tab4:
+    st.subheader("Strip Plot — Grup Karşılaştırmaları")
+    st.caption("Mean ± SD çizgili, anlamlılık parantezleri otomatik eklenir.")
+
+    sel_params = st.multiselect("Görselleştirilecek parametreler",
+                                 target_cols, default=target_cols[:4])
+
+    if sel_params:
+        n_plots = len(sel_params)
+        ncols = 2
+        nrows = (n_plots + 1) // 2
+        fig, axes = plt.subplots(nrows, ncols, figsize=(12, 4.5*nrows))
+        axes = np.atleast_2d(axes).flatten()
+
+        palette = ['#4A90E2', '#F5A623', '#7ED321', '#D0021B']
+
+        # Negatif olamayacak biyolojik parametreler (eksen 0'dan başlasın)
+        non_negative_params = {'SEDİM', 'CRP', 'NEU', 'PLT', 'LENFOSİT',
+                               'MONOSİT', 'NLR', 'PLR', 'NMLR', 'SIRI',
+                               'SII', 'AISI', 'YAŞ', 'HASTALIK SÜRESİ(yıl)'}
+
+        for idx, param in enumerate(sel_params):
+            ax = axes[idx]
+            sub = df.dropna(subset=[param, group_col])
+
+            # Bu parametrenin dağılımı normal mi? Buna göre overlay seç
+            is_normal_param, _ = shapiro_per_group(sub, param, group_col)
+            overlay_label = "Mean ± SD" if is_normal_param else "Median [IQR]"
+
+            # Strip plot
+            sns.stripplot(data=sub, x=group_col, y=param, order=group_order,
+                          ax=ax, palette=palette[:len(group_order)],
+                          jitter=0.25, alpha=0.7, size=4)
+
+            # Merkez (mean/median) ve dispersiyon (SD/IQR) çizgileri
+            for i, g in enumerate(group_order):
+                d = sub[sub[group_col]==g][param].dropna()
+                if len(d) == 0: continue
+                if is_normal_param:
+                    center = d.mean()
+                    lower, upper = center - d.std(), center + d.std()
+                else:
+                    q1, med, q3 = np.percentile(d, [25, 50, 75])
+                    center, lower, upper = med, q1, q3
+                # Negatif olamayacak parametrelerde alt sınırı 0'da kırp
+                if param in non_negative_params:
+                    lower = max(0, lower)
+                ax.hlines(center, i-0.3, i+0.3, colors='black', linewidth=2)
+                ax.vlines(i, lower, upper, colors='black', linewidth=1.5)
+                ax.hlines([lower, upper], i-0.1, i+0.1, colors='black', linewidth=1)
+
+            ax.set_title(f"{param}  ({overlay_label})", fontsize=12, fontweight='bold')
+            ax.set_xlabel("")
+            ax.set_ylabel("")
+            ax.tick_params(axis='x', rotation=15)
+
+            # Negatif olamayacak parametrelerde y-ekseni alt sınırını 0'a sabitle
+            if param in non_negative_params:
+                cur_bottom, cur_top = ax.get_ylim()
+                ax.set_ylim(bottom=max(0, cur_bottom * 0.95), top=cur_top)
+
+            # Anlamlılık parantezleri (ikili karşılaştırmalar)
+            y_max = sub[param].max()
+            y_range = sub[param].max() - sub[param].min()
+            y_step = y_range * 0.08
+
+            comparisons = []
+            for i in range(len(group_order)):
+                for j in range(i+1, len(group_order)):
+                    comparisons.append((i, j))
+
+            level = 0
+            for (i, j) in comparisons:
+                g1 = sub[sub[group_col]==group_order[i]][param].dropna()
+                g2 = sub[sub[group_col]==group_order[j]][param].dropna()
+                if len(g1) < 3 or len(g2) < 3: continue
+                is_normal_pair, _ = shapiro_per_group(
+                    sub[sub[group_col].isin([group_order[i], group_order[j]])],
+                    param, group_col)
+                if is_normal_pair:
+                    _, p = stats.ttest_ind(g1, g2, equal_var=False)
+                else:
+                    _, p = stats.mannwhitneyu(g1, g2)
+                if not pd.isna(p) and p < alpha:
+                    y_pos = y_max + y_step * (1 + level)
+                    add_significance_bracket(ax, i, j, y_pos, p, h=y_step*0.3)
+                    level += 1
+            # Y aralığını parantezlere göre genişlet
+            if level > 0:
+                ax.set_ylim(top=y_max + y_step * (level + 2))
+
+        # Boş subplot'ları gizle
+        for k in range(idx+1, len(axes)):
+            axes[k].set_visible(False)
+
+        plt.tight_layout()
+        st.pyplot(fig)
+
+        # İndirme
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+        st.download_button("📥 Şekli PNG olarak indir", buf.getvalue(),
+                           "stripplot.png", "image/png")
+
+# ────────────────────────────────────────────────
+# TAB 5: SPEARMAN KORELASYON HEATMAP
+# ────────────────────────────────────────────────
+with tab5:
+    st.subheader("Spearman Korelasyon Heatmap")
+
+    extra_vars = []
+    for c in ['YAŞ', 'HASTALIK SÜRESİ(yıl)']:
+        if c in df.columns: extra_vars.append(c)
+
+    all_corr_vars = extra_vars + target_cols
+    selected_vars = st.multiselect("Korelasyona dahil edilecek değişkenler",
+                                    all_corr_vars, default=all_corr_vars)
+
+    subset = st.radio("Hangi hasta grubu üzerinde?",
+                      ["Tüm hastalar", "Saf Mukokutanöz", "Komplike Behçet"],
+                      horizontal=True)
+
+    if subset == "Tüm hastalar":
+        df_corr = df[selected_vars].dropna()
     else:
-        st.error(f"Değişken eksik: {var}")
-        st.stop()
+        df_corr = df[df['Birlesik_Grup']==subset][selected_vars].dropna()
 
-probability = 1 / (1 + math.exp(-logit))
+    if len(df_corr) >= 5 and len(selected_vars) >= 2:
+        corr = df_corr.corr(method='spearman')
 
-# Risk kategorisi
-if probability < 0.3:
-    risk_class = "risk-low"
-    risk_label = "DÜŞÜK RİSK"
-    risk_emoji = "🟢"
-    interpretation = (
-        "Hastanın inflamatuar profili **saf mukokutanöz Behçet** ile uyumlu. "
-        "Vaskülit veya üveit tutulumu olasılığı düşük."
-    )
-elif probability < 0.7:
-    risk_class = "risk-mid"
-    risk_label = "ORTA RİSK"
-    risk_emoji = "🟡"
-    interpretation = (
-        "Belirsiz aralık. **Klinik değerlendirme ve görüntüleme** ile "
-        "doğrulama önerilir. Tek başına bu skor karar verici değildir."
-    )
-else:
-    risk_class = "risk-high"
-    risk_label = "YÜKSEK RİSK"
-    risk_emoji = "🔴"
-    interpretation = (
-        "Hastanın inflamatuar profili **komplike Behçet** (vaskülit/üveit) "
-        "ile yüksek derecede uyumlu. **Detaylı sistemik değerlendirme** önerilir."
-    )
+        # Alt üçgen maskesi
+        mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
 
-# ====== SONUÇ GÖSTERİMİ ======
-st.markdown("---")
-st.markdown(f"""
-<div class="result-box {risk_class}">
-    <div style="font-size: 1rem; color: #555; margin-bottom: 0.5rem;">
-        Komplike Behçet Olasılığı
-    </div>
-    <div class="prob-text">{probability:.1%}</div>
-    <div class="risk-label">{risk_emoji} {risk_label}</div>
-    <div style="margin-top: 1rem; color: #444;">{interpretation}</div>
-</div>
-""", unsafe_allow_html=True)
+        fig, ax = plt.subplots(figsize=(max(8, len(selected_vars)*0.9),
+                                         max(7, len(selected_vars)*0.8)))
+        sns.heatmap(corr, mask=mask, annot=True, fmt='.2f',
+                    cmap='coolwarm', center=0, vmin=-1, vmax=1,
+                    square=True, linewidths=0.5, cbar_kws={'shrink':0.7},
+                    annot_kws={'size':10}, ax=ax)
+        ax.set_title(f"Spearman Korelasyon Heatmap ({subset}, n={len(df_corr)})",
+                     fontsize=13, pad=15)
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        st.pyplot(fig)
 
-# Olasılık çubuğu
-st.markdown("##### Risk Spektrumu")
-bar_html = f"""
-<div style="position: relative; height: 30px; background: linear-gradient(to right, #4caf50 0%, #ff9800 50%, #d32f2f 100%); border-radius: 15px; overflow: hidden;">
-    <div style="position: absolute; left: {probability*100:.1f}%; top: -5px; width: 4px; height: 40px; background: #1a4d5c; transform: translateX(-2px);"></div>
-    <div style="position: absolute; left: {probability*100:.1f}%; top: -25px; transform: translateX(-50%); font-weight: 600; color: #1a4d5c;">▼ {probability:.1%}</div>
-</div>
-<div style="display: flex; justify-content: space-between; margin-top: 0.5rem; font-size: 0.85rem; color: #666;">
-    <span>%0 (Mukokutanöz)</span>
-    <span>%50</span>
-    <span>%100 (Komplike)</span>
-</div>
-"""
-st.markdown(bar_html, unsafe_allow_html=True)
+        # P-değerleri tablosu (anlamlı olanlar için)
+        with st.expander("📋 Anlamlı korelasyonlar (p < α)"):
+            sig_rows = []
+            for i in range(len(selected_vars)):
+                for j in range(i+1, len(selected_vars)):
+                    a, b = selected_vars[i], selected_vars[j]
+                    if a in df_corr.columns and b in df_corr.columns:
+                        try:
+                            r, p = stats.spearmanr(df_corr[a], df_corr[b])
+                            if p < alpha:
+                                sig_rows.append({
+                                    'Değişken 1': a, 'Değişken 2': b,
+                                    'r (Spearman)': f"{r:.3f}", 'p': fmt_p(p)
+                                })
+                        except Exception:
+                            pass
+            if sig_rows:
+                st.dataframe(pd.DataFrame(sig_rows).sort_values('p'))
+            else:
+                st.info("Anlamlı korelasyon bulunamadı.")
 
-# Cut-off karşılaştırması
-if model.get('cutoff'):
-    primary_marker = list(model['coefs'].keys())[0]
-    if primary_marker in all_indices:
-        cur_val = all_indices[primary_marker]
-        comparison = "≥" if cur_val >= model['cutoff'] else "<"
-        st.markdown(f"""
-        <div class="info-box">
-        <b>Cut-off karşılaştırması:</b><br>
-        Hastanın {primary_marker} değeri: <b>{cur_val:.2f}</b><br>
-        Modelin optimal cut-off değeri (Youden J): <b>{model['cutoff']:.2f}</b><br>
-        {primary_marker} {comparison} {model['cutoff']:.2f} →
-        Bu cut-off'ta sensitivite <b>{model['sens']:.1f}%</b>,
-        spesifite <b>{model['spec']:.1f}%</b>
-        </div>
-        """, unsafe_allow_html=True)
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+        st.download_button("📥 Heatmap'i PNG olarak indir", buf.getvalue(),
+                           "correlation_heatmap.png", "image/png")
+    else:
+        st.warning("Yeterli veri yok (en az 5 hasta + 2 değişken gerekli).")
 
-# ====== DISCLAIMER ======
-st.markdown("""
-<div class="disclaimer">
-<b>⚠️ Önemli Uyarı:</b><br>
-Bu araç yalnızca <b>araştırma ve eğitim amaçlıdır</b>. Klinik karar verme süreçlerinde
-tek başına kullanılmamalıdır. Modelin türetildiği kohort tek merkezlidir ve harici
-validasyon gerektirir. Her hastanın klinik değerlendirmesi bireysel olarak yapılmalı,
-sistemik tutulum şüphesinde uygun görüntüleme ve laboratuvar tetkikleri istenmelidir.
-<br><br>
-Bu hesaplayıcı tıbbi tavsiye yerine geçmez.
-</div>
-""", unsafe_allow_html=True)
+# ────────────────────────────────────────────────
+# TAB 6: ROC ANALİZİ (Figure 2 tarzı)
+# ────────────────────────────────────────────────
+with tab6:
+    st.subheader("ROC Eğri Analizi — Tanısal Performans")
 
-st.markdown("---")
-st.caption("Behçet Risk Hesaplayıcı v1.0 · https://behcetrisc.streamlit.app/")
+    if not HAS_SKLEARN:
+        st.error("scikit-learn paketi gerekli: `pip install scikit-learn`")
+    else:
+        st.caption("Komplike Behçet'i Saf Mukokutanöz'den ayırt etme gücü.")
+
+        # Pozitif sınıf: Komplike Behçet
+        df_roc = df.dropna(subset=target_cols + ['Birlesik_Grup'])
+        y_true = (df_roc['Birlesik_Grup'] == 'Komplike Behçet').astype(int)
+
+        sel_roc = st.multiselect("ROC için parametreler",
+                                  target_cols, default=target_cols)
+
+        if sel_roc and len(y_true.unique()) == 2:
+            fig, ax = plt.subplots(figsize=(8, 7))
+            colors = plt.cm.tab10(np.linspace(0, 1, len(sel_roc)))
+
+            roc_results = []
+            for i, param in enumerate(sel_roc):
+                scores = df_roc[param].values
+                fpr, tpr, thresholds = roc_curve(y_true, scores)
+                roc_auc = auc(fpr, tpr)
+
+                # AUC < 0.5 → parametre TERS YÖNLÜ prediktör
+                # (örn. düşük LENFOSİT komplike hastalığı öngörür)
+                if roc_auc < 0.5:
+                    # Skoru ters çevirerek gerçek AUC'yi al
+                    fpr, tpr, thr_flip = roc_curve(y_true, -scores)
+                    roc_auc = auc(fpr, tpr)
+                    thresholds = -thr_flip  # eşiği orijinal birime geri çevir
+                    direction = "↓"  # düşük değer komplikeyi öngörür
+                    direction_label = "düşük değer → Komplike"
+                else:
+                    direction = "↑"  # yüksek değer komplikeyi öngörür
+                    direction_label = "yüksek değer → Komplike"
+
+                # Youden J ile optimal cut-off
+                j_scores = tpr - fpr
+                opt_idx = np.argmax(j_scores)
+                opt_thr = thresholds[opt_idx]
+                opt_sens = tpr[opt_idx]
+                opt_spec = 1 - fpr[opt_idx]
+
+                # Eğri etiketi: ters yönlüleri belirt
+                label_suffix = " ↓" if direction == "↓" else ""
+                ax.plot(fpr, tpr, color=colors[i], linewidth=2,
+                        label=f"{param}{label_suffix} (AUC = {roc_auc:.3f})")
+
+                # Cut-off yorumu: ters yönlüde "≤", normal yönde "≥"
+                cutoff_op = "≤" if direction == "↓" else "≥"
+
+                roc_results.append({
+                    'Parametre': param,
+                    'Yön': direction,
+                    'AUC': f"{roc_auc:.3f}",
+                    'Cut-off': f"{cutoff_op} {opt_thr:.2f}",
+                    'Sensitivite': f"{opt_sens:.2%}",
+                    'Spesifite': f"{opt_spec:.2%}",
+                    'Youden J': f"{j_scores[opt_idx]:.3f}",
+                    'Yorum': direction_label
+                })
+
+            ax.plot([0,1], [0,1], 'k--', alpha=0.5, linewidth=1)
+            ax.set_xlim([0, 1])
+            ax.set_ylim([0, 1.02])
+            ax.set_xlabel("False Positive Rate (1 − Specificity)", fontsize=12)
+            ax.set_ylabel("True Positive Rate (Sensitivity)", fontsize=12)
+            ax.set_title("Multiple ROC Curves\n(Komplike vs Saf Mukokutanöz Behçet)",
+                         fontsize=13)
+            ax.legend(loc='lower right', fontsize=10)
+            ax.grid(alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig)
+
+            st.subheader("Optimal Cut-off Değerleri (Youden J)")
+            roc_df = pd.DataFrame(roc_results).sort_values('AUC', ascending=False)
+            st.dataframe(roc_df, use_container_width=True)
+
+            csv = roc_df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button("📥 ROC sonuçlarını CSV indir", csv,
+                               "roc_results.csv", "text/csv")
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+            st.download_button("📥 ROC şeklini PNG indir", buf.getvalue(),
+                               "roc_curves.png", "image/png")
+
+            # ─── DeLong testi: AUC'ler arası karşılaştırma ───
+            st.markdown("---")
+            st.subheader("📐 DeLong Testi — AUC'ler arası anlamlı fark var mı?")
+            st.caption("İki bağımlı ROC eğrisini istatistiksel olarak karşılaştırır "
+                       "(aynı hastalar, farklı belirteçler). p < 0.05 → AUC'ler "
+                       "anlamlı derecede farklı.")
+
+            # Her belirteç için "etkin" skorları (ters yönlüleri çevrilmiş) hazırla
+            score_map = {}
+            for param in sel_roc:
+                raw = df_roc[param].values
+                score_map[param] = effective_scores(y_true.values, raw)
+
+            # Çift yönlü DeLong matrisi
+            n = len(sel_roc)
+            pval_matrix = np.full((n, n), np.nan)
+            for i in range(n):
+                for j in range(i+1, n):
+                    try:
+                        _, _, _, p = delong_test(
+                            y_true.values,
+                            score_map[sel_roc[i]],
+                            score_map[sel_roc[j]]
+                        )
+                        pval_matrix[i, j] = p
+                        pval_matrix[j, i] = p
+                    except Exception:
+                        pass
+
+            pval_df = pd.DataFrame(pval_matrix, index=sel_roc, columns=sel_roc)
+
+            # Renkli görselleştirme: anlamlı farkları vurgula
+            def fmt_cell(v):
+                if pd.isna(v): return "—"
+                if v < 0.001: return "<0.001"
+                return f"{v:.3f}"
+
+            display_df = pval_df.map(fmt_cell)
+
+            def hl_sig(v):
+                try:
+                    if v == "—": return ''
+                    p = 0.0005 if v == "<0.001" else float(v)
+                    if p < 0.001: return 'background-color: #2E86AB; color: white'
+                    if p < 0.01:  return 'background-color: #A4C9E1'
+                    if p < 0.05:  return 'background-color: #D4EFDF'
+                    return ''
+                except: return ''
+
+            st.dataframe(display_df.style.map(hl_sig), use_container_width=True)
+            st.caption("🟦 koyu mavi: p<0.001 | 🟨 açık mavi: p<0.01 | 🟩 yeşil: p<0.05")
+
+            # En yüksek AUC'li belirteçle diğerlerini özetle
+            best_idx = roc_df['AUC'].astype(float).idxmax() if len(roc_df) > 0 else None
+            if best_idx is not None and best_idx in roc_df.index:
+                best_param = roc_df.loc[best_idx, 'Parametre']
+                st.markdown(f"**En yüksek AUC: {best_param}**. Diğer belirteçlerle DeLong karşılaştırması:")
+                rows = []
+                for p in sel_roc:
+                    if p == best_param: continue
+                    try:
+                        a1, a2, z, pv = delong_test(
+                            y_true.values,
+                            score_map[best_param],
+                            score_map[p]
+                        )
+                        rows.append({
+                            'Karşılaştırma': f"{best_param} vs {p}",
+                            f'AUC ({best_param})': f"{a1:.3f}",
+                            f'AUC ({p})': f"{a2:.3f}",
+                            'ΔAUC': f"{a1-a2:+.3f}",
+                            'z': f"{z:.3f}",
+                            'p': fmt_cell(pv)
+                        })
+                    except Exception:
+                        pass
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+# ────────────────────────────────────────────────
+# YAN PANEL NOTLARI
+# ────────────────────────────────────────────────
+# ────────────────────────────────────────────────
+# TAB 7: LOJİSTİK REGRESYON + NOMOGRAM
+# ────────────────────────────────────────────────
+with tab7:
+    st.subheader("🔬 Lojistik Regresyon — Covariate Düzeltmesi + Nomogram")
+
+    if not HAS_STATSMODELS or not HAS_SKLEARN:
+        st.error("Bu sekme için `statsmodels` ve `scikit-learn` gerekli.")
+    else:
+        import statsmodels.api as sm
+
+        st.markdown(
+            "**Bağımlı değişken:** Komplike Behçet (1) vs Saf Mukokutanöz (0)"
+        )
+        st.caption(
+            "Lojistik regresyon ile birden fazla belirteci aynı modele koyarsın; "
+            "yaş, hastalık süresi, ilaç gibi karıştırıcıları (covariate) düzelterek "
+            "**her belirtecin bağımsız katkısını** ölçer."
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            default_marker = 'SIRI' if 'SIRI' in target_cols else target_cols[0]
+            primary_marker = st.selectbox(
+                "Ana belirteç",
+                target_cols,
+                index=target_cols.index(default_marker)
+            )
+
+        # Olası covariate'leri tespit et
+        covariate_pool = []
+        for c in ['YAŞ', 'HASTALIK SÜRESİ(yıl)', 'Kolşisin', 'Biyolojik', 'DMARD']:
+            if c in df.columns: covariate_pool.append(c)
+
+        with col2:
+            covariates = st.multiselect(
+                "Eş değişkenler (covariates)",
+                covariate_pool,
+                default=[c for c in ['YAŞ', 'HASTALIK SÜRESİ(yıl)'] if c in covariate_pool]
+            )
+
+        # Veriyi hazırla
+        predictors = [primary_marker] + [c for c in covariates if c != primary_marker]
+        data_lr = df.dropna(subset=predictors + ['Birlesik_Grup']).copy()
+        y_lr = (data_lr['Birlesik_Grup'] == 'Komplike Behçet').astype(int)
+        X_lr = data_lr[predictors].copy()
+        X_lr_const = sm.add_constant(X_lr, has_constant='add')
+
+        # ─── COMPLETE SEPARATION TESPİTİ ───
+        separation_warnings = []
+        for c in predictors:
+            col_data = data_lr[c]
+            # Sadece binary/az unique değişkenler için anlamlı
+            if col_data.nunique() <= 5:
+                ct = pd.crosstab(col_data, y_lr)
+                # Herhangi bir hücre 0 mı?
+                zero_cells = (ct == 0).sum().sum()
+                if zero_cells > 0:
+                    # Hangi değer hangi gruba özgü?
+                    for val in ct.index:
+                        row = ct.loc[val]
+                        if (row == 0).any():
+                            absent_group = "Komplike Behçet" if row[1] == 0 else "Saf Mukokutanöz"
+                            present_count = int(row.sum())
+                            separation_warnings.append({
+                                'variable': c,
+                                'value': val,
+                                'absent_group': absent_group,
+                                'present_count': present_count,
+                                'crosstab': ct
+                            })
+
+        if separation_warnings:
+            with st.container():
+                st.error(
+                    "⚠️ **COMPLETE SEPARATION TESPİT EDİLDİ** — Standart lojistik regresyon "
+                    "bazı değişkenlerde **şişirilmiş** OR ve CI değerleri verecek. "
+                    "Aşağıdaki **Firth penalized regression** seçeneğini kullanmanı öneririm."
+                )
+                for w in separation_warnings:
+                    st.markdown(
+                        f"- **{w['variable']} = {w['value']}** olan {w['present_count']} hasta "
+                        f"sadece tek bir grupta var (**{w['absent_group']}** grubunda hiç yok). "
+                        f"Bu durum OR'nin sonsuza yakın çıkmasına neden olur."
+                    )
+                    with st.expander(f"📋 {w['variable']} × grup çapraz tablosu"):
+                        st.dataframe(w['crosstab'])
+
+        # ─── Yöntem seçimi: Standart MLE vs Firth ───
+        use_firth_default = bool(separation_warnings) and HAS_FIRTH
+        method_help = (
+            "**Standart MLE:** Klasik lojistik regresyon. Complete separation varsa OR şişer.\n\n"
+            "**Firth penalized:** Jeffreys prior ile düzenlenmiş; az örnek veya separation durumunda güvenilir."
+        )
+        method_choice = st.radio(
+            "Regresyon yöntemi",
+            ["Standart MLE", "Firth penalized"] if HAS_FIRTH else ["Standart MLE"],
+            index=1 if use_firth_default else 0,
+            horizontal=True,
+            help=method_help
+        )
+
+        if method_choice == "Firth penalized" and not HAS_FIRTH:
+            st.warning("`firthlogist` paketi kurulu değil. `pip install firthlogist` ile kurun.")
+            method_choice = "Standart MLE"
+
+        use_firth = (method_choice == "Firth penalized")
+
+        try:
+            # ─── Model fit (MLE veya Firth) ───
+            if use_firth:
+                # Manuel Firth implementasyonu
+                firth_res = firth_logistic_regression(X_lr_const.values, y_lr.values)
+                params = pd.Series(firth_res['beta'], index=X_lr_const.columns)
+                conf = pd.DataFrame({
+                    0: firth_res['ci_lo'],
+                    1: firth_res['ci_hi']
+                }, index=X_lr_const.columns)
+                pvals = pd.Series(firth_res['pvals'], index=X_lr_const.columns)
+                pred_full = pd.Series(firth_res['fitted_prob'], index=data_lr.index)
+                # Pseudo-R²
+                ll_model = firth_res['loglik']
+                p_null = y_lr.mean()
+                ll_null = (y_lr * np.log(p_null + 1e-12) +
+                            (1-y_lr) * np.log(1 - p_null + 1e-12)).sum()
+                pseudo_r2 = 1 - (ll_model / ll_null) if ll_null != 0 else np.nan
+                aic_val = -2 * ll_model + 2 * (len(predictors) + 1)
+                llr_p = stats.chi2.sf(2*(ll_model - ll_null), df=len(predictors))
+                model_label = "Firth Penalized Regression"
+            else:
+                model = sm.Logit(y_lr, X_lr_const).fit(disp=False, maxiter=100)
+                params = model.params
+                conf = model.conf_int()
+                pvals = model.pvalues
+                pred_full = model.predict(X_lr_const)
+                pseudo_r2 = model.prsquared
+                aic_val = model.aic
+                llr_p = model.llr_pvalue
+                model_label = "Standart MLE Logistic Regression"
+
+            st.caption(f"📋 Yöntem: **{model_label}**")
+
+            # ─── Odds Ratio Tablosu ───
+            st.markdown("### 📊 Model Çıktısı: Odds Ratios (95% CI)")
+
+            or_rows = []
+            for var in params.index:
+                if var == 'const': continue
+                or_val = np.exp(params[var])
+                or_lo = np.exp(conf.loc[var, 0])
+                or_hi = np.exp(conf.loc[var, 1])
+                # Çok büyük OR'leri uyarı ile göster
+                or_str = f"{or_val:.3f}" if or_val < 1000 else f"{or_val:.2e}"
+                ci_str = (f"[{or_lo:.3f} – {or_hi:.3f}]"
+                          if or_hi < 1000 else f"[{or_lo:.2e} – {or_hi:.2e}]")
+                or_rows.append({
+                    'Değişken': var,
+                    'β (coef)': f"{params[var]:+.3f}",
+                    'OR': or_str,
+                    '95% CI': ci_str,
+                    'p': fmt_p(pvals[var])
+                })
+            or_df = pd.DataFrame(or_rows)
+
+            def hl_or_p(v):
+                try:
+                    if v == "<0.001": return 'background-color: #D4EFDF'
+                    return 'background-color: #D4EFDF' if float(v) < alpha else ''
+                except: return ''
+
+            st.dataframe(or_df.style.map(hl_or_p, subset=['p']),
+                         use_container_width=True)
+
+            # Model fit istatistikleri
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("McFadden Pseudo R²", f"{pseudo_r2:.3f}")
+            c2.metric("AIC", f"{aic_val:.1f}")
+            c3.metric("LLR p-value", fmt_p(llr_p))
+            c4.metric("Konkordans (n)", f"{int(y_lr.sum())}/{len(y_lr)}")
+
+            # ─── OR Forest Plot ───
+            st.markdown("### 🌳 Forest Plot (Odds Ratio)")
+            fig_or, ax_or = plt.subplots(figsize=(9, max(3, 0.5*len(predictors)+2)))
+            var_names = [v for v in params.index if v != 'const']
+            ors_raw = [np.exp(params[v]) for v in var_names]
+            ci_lo_raw = [np.exp(conf.loc[v, 0]) for v in var_names]
+            ci_hi_raw = [np.exp(conf.loc[v, 1]) for v in var_names]
+
+            # Görsel için ekstrem CI'leri kırp (1e-3 ile 1e6 arası)
+            CLIP_LO, CLIP_HI = 1e-3, 1e6
+            ors = [max(CLIP_LO, min(CLIP_HI, o)) for o in ors_raw]
+            ci_lo = [max(CLIP_LO, min(CLIP_HI, c)) for c in ci_lo_raw]
+            ci_hi = [max(CLIP_LO, min(CLIP_HI, c)) for c in ci_hi_raw]
+            clipped_flags = [(o > CLIP_HI or c_hi > CLIP_HI or c_lo < CLIP_LO)
+                              for o, c_lo, c_hi in zip(ors_raw, ci_lo_raw, ci_hi_raw)]
+
+            y_pos = np.arange(len(var_names))
+            ax_or.errorbar(ors, y_pos,
+                            xerr=[np.array(ors)-np.array(ci_lo),
+                                  np.array(ci_hi)-np.array(ors)],
+                            fmt='o', color='#2E86AB', ecolor='gray',
+                            capsize=4, markersize=8)
+            ax_or.axvline(1, color='red', linestyle='--', alpha=0.6, label='OR = 1')
+            ax_or.set_yticks(y_pos)
+            # Etiketlere "*" ekle eğer clipped ise
+            labels = [v + (" *" if f else "") for v, f in zip(var_names, clipped_flags)]
+            ax_or.set_yticklabels(labels)
+            ax_or.set_xscale('log')
+            ax_or.set_xlabel("Odds Ratio (log scale)")
+            ax_or.set_title("Düzeltilmiş Odds Ratios — 95% CI ile" +
+                              ("\n(* CI sınırları görsel için kırpıldı)" if any(clipped_flags) else ""))
+            ax_or.legend()
+            ax_or.grid(axis='x', alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_or)
+
+            # ─── Düzeltilmiş vs Düzeltilmemiş ROC ───
+            st.markdown("---")
+            st.markdown("### 🎯 Düzeltilmiş vs Düzeltilmemiş ROC")
+
+            # Düzeltilmemiş: sadece ana belirteç tek başına
+            if use_firth:
+                X_single_const = sm.add_constant(data_lr[[primary_marker]], has_constant='add')
+                firth_single = firth_logistic_regression(X_single_const.values, y_lr.values)
+                pred_single = pd.Series(firth_single['fitted_prob'], index=data_lr.index)
+            else:
+                X_single = sm.add_constant(data_lr[[primary_marker]], has_constant='add')
+                model_single = sm.Logit(y_lr, X_single).fit(disp=False, maxiter=100)
+                pred_single = model_single.predict(X_single)
+
+            fpr1, tpr1, _ = roc_curve(y_lr, pred_single)
+            auc1 = auc(fpr1, tpr1)
+            fpr2, tpr2, _ = roc_curve(y_lr, pred_full)
+            auc2 = auc(fpr2, tpr2)
+
+            fig_adj, ax_adj = plt.subplots(figsize=(8, 7))
+            ax_adj.plot(fpr1, tpr1, lw=2.5, color='#E07A5F',
+                        label=f"{primary_marker} tek başına (AUC = {auc1:.3f})")
+            ax_adj.plot(fpr2, tpr2, lw=2.5, color='#3D405B',
+                        label=f"+ covariates ({len(covariates)} ek değişken) AUC = {auc2:.3f}")
+            ax_adj.plot([0,1], [0,1], 'k--', alpha=0.4)
+            ax_adj.set_xlabel("1 − Spesifite (FPR)", fontsize=12)
+            ax_adj.set_ylabel("Sensitivite (TPR)", fontsize=12)
+            ax_adj.set_title("Düzeltilmemiş vs Düzeltilmiş ROC", fontsize=13)
+            ax_adj.legend(loc='lower right')
+            ax_adj.grid(alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_adj)
+
+            # DeLong testi: tek vs tam model
+            try:
+                _, _, z_dl, p_dl = delong_test(y_lr.values,
+                                                 pred_single.values,
+                                                 pred_full.values)
+                st.info(
+                    f"**DeLong testi (tek belirteç vs düzeltilmiş model):** "
+                    f"ΔAUC = {auc2-auc1:+.3f}, z = {z_dl:.3f}, p = **{fmt_p(p_dl)}**"
+                )
+                if p_dl < alpha:
+                    st.success(
+                        "Covariate eklemek modelin ayırt etme gücünü ANLAMLI olarak değiştirdi."
+                    )
+                else:
+                    st.warning(
+                        f"{primary_marker} büyük ölçüde **bağımsız** bir belirteç — "
+                        "yaş/hastalık süresi/ilaç düzeltmesi modeli istatistiksel olarak "
+                        "anlamlı derecede iyileştirmedi."
+                    )
+            except Exception as e:
+                st.warning(f"DeLong hesaplanamadı: {e}")
+
+            # ─── NOMOGRAM ───
+            st.markdown("---")
+            st.markdown("### 📐 Nomogram")
+            with st.expander("ℹ️ Nomogram nasıl okunur?"):
+                st.markdown("""
+                Her satırda hastanın değerini bul → üstteki **Points** ekseninden 
+                puanı oku → tüm değişkenlerin puanlarını topla → en alttaki 
+                **Total Points** ekseninde toplam puanı işaretle → karşı eksenden 
+                **Predicted Probability** (komplike Behçet olasılığı) değerini oku.
+                """)
+
+            try:
+                # Her değişken için katkı aralığı (params zaten yukarıda tanımlandı, MLE ya da Firth)
+                intercept = params['const']
+                var_info = []
+                for v in predictors:
+                    x_min, x_max = float(data_lr[v].min()), float(data_lr[v].max())
+                    b = float(params[v])
+                    is_binary = data_lr[v].nunique() <= 2
+                    rng = abs(b * (x_max - x_min))
+                    var_info.append({
+                        'name': v, 'b': b,
+                        'x_min': x_min, 'x_max': x_max,
+                        'is_binary': is_binary, 'range': rng
+                    })
+
+                max_range = max(vi['range'] for vi in var_info) if var_info else 1
+                scale = 100.0 / max_range if max_range > 0 else 1  # puan/lp birimi
+                total_max = sum(vi['range'] for vi in var_info) * scale
+
+                # Yardımcı: çakışmayı önleyecek tick yerleşimi
+                def smart_ticks(x_min, x_max, b, scale, min_pixel_gap=80, fig_width_px=1100):
+                    """
+                    Continuous değişken için tick'leri seç:
+                    - 'Güzel' yuvarlanmış sayılar üret (1, 2, 5, 10 gibi)
+                    - Birbirine çok yakın olanları ele
+                    - Etiketin yatay aralığını fig_width'e göre hesapla
+                    """
+                    rng = x_max - x_min
+                    if rng <= 0:
+                        return [x_min], [f"{x_min:.0f}"]
+
+                    # "Güzel" adım belirle
+                    raw_step = rng / 5
+                    magnitude = 10 ** np.floor(np.log10(raw_step))
+                    for mult in [1, 2, 2.5, 5, 10]:
+                        step = mult * magnitude
+                        if rng / step <= 8:
+                            break
+                    # tick'leri üret
+                    start = np.ceil(x_min / step) * step
+                    ticks = np.arange(start, x_max + step*0.01, step)
+                    ticks = ticks[(ticks >= x_min) & (ticks <= x_max)]
+                    # Sınırları ekle, ama yakınsa atla
+                    if len(ticks) == 0 or abs(ticks[0] - x_min) > step * 0.3:
+                        ticks = np.concatenate([[x_min], ticks])
+                    if abs(ticks[-1] - x_max) > step * 0.3:
+                        ticks = np.concatenate([ticks, [x_max]])
+
+                    # Etiketleri formatla
+                    if step >= 1:
+                        labels = [f"{t:.0f}" for t in ticks]
+                    else:
+                        decimals = max(0, int(-np.floor(np.log10(step))))
+                        labels = [f"{t:.{decimals}f}" for t in ticks]
+
+                    # Pixel cinsinden çakışma kontrolü
+                    pts = [(t - x_min) * abs(b) * scale if b > 0 else
+                           (x_max - t) * abs(b) * scale for t in ticks]
+                    # Eğer pts içinde mesafe < min_pixel_gap (puan biriminde) ise filtrele
+                    # Puan ekseni 100 birim → pixel cinsinden gap = (gap_pts/100)*fig_width_px
+                    # tersi: min_pts_gap = (min_pixel_gap/fig_width_px)*100
+                    min_pts_gap = (min_pixel_gap / fig_width_px) * 100
+                    keep = [True]
+                    last_pt = pts[0]
+                    for i in range(1, len(pts)):
+                        if abs(pts[i] - last_pt) >= min_pts_gap:
+                            keep.append(True)
+                            last_pt = pts[i]
+                        else:
+                            keep.append(False)
+                    # Son tick'i her zaman tut (sınır)
+                    if not keep[-1] and len(keep) > 1:
+                        keep[-1] = True
+                        # Eğer son ile bir önceki çok yakınsa, bir öncekini ele
+                        if len(pts) >= 2 and abs(pts[-1] - pts[-2]) < min_pts_gap:
+                            keep[-2] = False
+                    ticks_f = [t for t, k in zip(ticks, keep) if k]
+                    labels_f = [l for l, k in zip(labels, keep) if k]
+                    return ticks_f, labels_f
+
+                n_axes = 1 + len(predictors) + 2
+                fig_n, axes_n = plt.subplots(n_axes, 1,
+                                               figsize=(14, 0.75*n_axes + 1.5))
+                plt.subplots_adjust(hspace=1.2, left=0.18, right=0.96,
+                                     top=0.93, bottom=0.05)
+
+                def draw_axis(ax, xmin, xmax, ticks, labels, title, color='black',
+                                fontsize=9):
+                    ax.set_xlim(xmin, xmax * 1.02)
+                    ax.set_ylim(0, 1)
+                    ax.hlines(0.5, xmin, xmax, color=color, lw=1.5)
+                    for t, lbl in zip(ticks, labels):
+                        if xmin - 0.5 <= t <= xmax + 0.5:
+                            ax.vlines(t, 0.4, 0.6, color=color, lw=1.2)
+                            ax.text(t, -0.15, lbl, ha='center', va='top',
+                                    fontsize=fontsize)
+                    ax.set_yticks([]); ax.set_xticks([])
+                    ax.set_ylabel(title, rotation=0, ha='right', va='center',
+                                   fontsize=10, labelpad=20)
+                    for sp in ax.spines.values(): sp.set_visible(False)
+
+                # 1) Üst eksen: Points (0-100)
+                pts_ticks = np.arange(0, 101, 10)
+                draw_axis(axes_n[0], 0, 100, pts_ticks,
+                           [str(int(t)) for t in pts_ticks], "Points",
+                           color='#2E86AB', fontsize=9)
+
+                # 2) Her değişken için bir eksen — akıllı tick yerleşimi
+                for i, vi in enumerate(var_info):
+                    ax = axes_n[i + 1]
+                    if vi['is_binary']:
+                        if vi['b'] > 0:
+                            pts = [0, vi['b'] * scale]
+                            labels = ['0', '1']
+                        else:
+                            pts = [abs(vi['b']) * scale, 0]
+                            labels = ['0', '1']
+                        draw_axis(ax, 0, 100, pts, labels, vi['name'], fontsize=10)
+                    else:
+                        x_ticks, x_labels = smart_ticks(vi['x_min'], vi['x_max'],
+                                                          vi['b'], scale,
+                                                          min_pixel_gap=90)
+                        if vi['b'] > 0:
+                            pts = [(x - vi['x_min']) * vi['b'] * scale
+                                   for x in x_ticks]
+                        else:
+                            pts = [(vi['x_max'] - x) * abs(vi['b']) * scale
+                                   for x in x_ticks]
+                        draw_axis(ax, 0, 100, pts, x_labels, vi['name'], fontsize=9)
+
+                # 3) Total Points — daha az tick
+                # Hedef: ~8-10 tick, çakışmasız
+                tot_step_raw = total_max / 8
+                tot_mag = 10 ** np.floor(np.log10(tot_step_raw))
+                for mult in [1, 2, 2.5, 5, 10]:
+                    tot_step = mult * tot_mag
+                    if total_max / tot_step <= 12: break
+                tot_ticks = np.arange(0, total_max + tot_step*0.01, tot_step)
+                draw_axis(axes_n[-2], 0, total_max, tot_ticks,
+                           [f"{t:.0f}" for t in tot_ticks], "Total\nPoints",
+                           color='#A23B72', fontsize=9)
+
+                # 4) Predicted Probability
+                prob_levels = [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
+                prob_ticks, prob_labels = [], []
+                min_contribs_sum = sum(
+                    vi['b'] * vi['x_min'] if vi['b'] > 0 else vi['b'] * vi['x_max']
+                    for vi in var_info
+                )
+                for p in prob_levels:
+                    logit_p = np.log(p / (1 - p))
+                    lp_total = logit_p - intercept
+                    tp = (lp_total - min_contribs_sum) * scale
+                    if 0 <= tp <= total_max:
+                        prob_ticks.append(tp)
+                        prob_labels.append(f"{p:.2f}")
+
+                # Olasılık tick'lerinde de çakışma kontrolü
+                if len(prob_ticks) > 1:
+                    min_gap = total_max * 0.05  # En az %5'lik boşluk
+                    filtered_t, filtered_l = [prob_ticks[0]], [prob_labels[0]]
+                    for t, l in zip(prob_ticks[1:], prob_labels[1:]):
+                        if t - filtered_t[-1] >= min_gap:
+                            filtered_t.append(t)
+                            filtered_l.append(l)
+                    prob_ticks, prob_labels = filtered_t, filtered_l
+
+                draw_axis(axes_n[-1], 0, total_max, prob_ticks, prob_labels,
+                           "Predicted\nProbability\n(Komplike)",
+                           color='#F18F01', fontsize=9)
+
+                fig_n.suptitle(
+                    f"Nomogram — Komplike Behçet Risk Tahmini\n"
+                    f"(Model AUC = {auc2:.3f}, n = {len(data_lr)}, {model_label})",
+                    fontsize=11, y=0.99
+                )
+                st.pyplot(fig_n)
+
+                buf = io.BytesIO()
+                fig_n.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+                st.download_button("📥 Nomogramı PNG indir", buf.getvalue(),
+                                    "nomogram.png", "image/png")
+            except Exception as e:
+                st.warning(f"Nomogram çizilemedi: {e}")
+
+            # ─── İNTERAKTİF RİSK HESAPLAYICI ───
+            st.markdown("---")
+            st.markdown("### 🧮 İnteraktif Risk Hesaplayıcı")
+            st.caption("Hasta değerlerini gir, anlık tahmin al.")
+
+            calc_cols = st.columns(min(len(predictors), 4))
+            user_vals = {}
+            for i, var in enumerate(predictors):
+                with calc_cols[i % len(calc_cols)]:
+                    is_bin = data_lr[var].nunique() <= 2
+                    if is_bin:
+                        user_vals[var] = st.selectbox(
+                            var, [0, 1],
+                            index=0,
+                            help=f"OR = {np.exp(params[var]):.2f}"
+                        )
+                    else:
+                        median_val = float(data_lr[var].median())
+                        user_vals[var] = st.number_input(
+                            var,
+                            value=median_val,
+                            min_value=float(data_lr[var].min()*0.5),
+                            max_value=float(data_lr[var].max()*1.5),
+                            step=0.1,
+                            help=f"OR = {np.exp(params[var]):.3f} her birim artış için"
+                        )
+
+            # Olasılığı hesapla (MLE veya Firth)
+            # Linear predictor manuel hesapla, her iki yöntemde de çalışsın
+            user_logit_raw = float(intercept)
+            for var, val in user_vals.items():
+                user_logit_raw += float(params[var]) * val
+            user_prob = 1 / (1 + math.exp(-user_logit_raw)) if abs(user_logit_raw) < 700 else (1.0 if user_logit_raw > 0 else 0.0)
+            user_logit = user_logit_raw
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Komplike Olasılığı", f"{user_prob:.1%}")
+            c2.metric("Linear Predictor (η)", f"{user_logit:+.2f}")
+            risk_cat = ("Düşük" if user_prob < 0.3 else
+                         "Orta" if user_prob < 0.7 else "Yüksek")
+            c3.metric("Risk Kategorisi", risk_cat)
+
+            # Olasılık çubuğu
+            fig_bar, ax_bar = plt.subplots(figsize=(10, 1.5))
+            ax_bar.barh(0, user_prob, color='#E07A5F', height=0.5)
+            ax_bar.barh(0, 1-user_prob, left=user_prob,
+                         color='#E5E5E5', height=0.5)
+            ax_bar.axvline(0.5, color='black', linestyle='--', alpha=0.5)
+            ax_bar.set_xlim(0, 1)
+            ax_bar.set_yticks([])
+            ax_bar.set_xticks(np.arange(0, 1.1, 0.1))
+            ax_bar.set_xticklabels([f"{int(x*100)}%" for x in np.arange(0,1.1,0.1)])
+            ax_bar.set_title(f"Tahmin edilen olasılık: {user_prob:.1%}",
+                              fontsize=11)
+            for sp in ['top','right','left']: ax_bar.spines[sp].set_visible(False)
+            st.pyplot(fig_bar)
+
+        except Exception as e:
+            st.error(f"Regresyon çalıştırılamadı: {e}")
+            st.exception(e)
+
+st.sidebar.markdown("---")
+st.sidebar.info("""
+**Analiz Akışı:**
+1. Her grupta Shapiro-Wilk → grup-bazlı normallik
+2. Levene → varyans homojenliği
+3. Normal+eşit varyans: t-test / ANOVA
+   Normal+eşit değil: Welch
+   Non-normal: MWU / Kruskal-Wallis
+4. Post-hoc: Tukey HSD veya Dunn (Holm düzeltmeli)
+5. FDR (BH) ile çoklu test düzeltmesi
+6. ROC + Youden J ile optimal cut-off
+7. DeLong testi → AUC karşılaştırması
+8. Lojistik regresyon → covariate düzeltmesi
+""")
