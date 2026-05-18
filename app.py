@@ -1037,6 +1037,14 @@ with tab7:
     else:
         import statsmodels.api as sm
 
+        st.info(
+            "📑 **Bu sekmede sırasıyla:** "
+            "Ana belirteç + covariate seçimi → OR tablosu → Forest plot → "
+            "Düzeltilmiş ROC → **Nomogram** → **📏 Kalibrasyon eğrisi** → "
+            "**🔄 Bootstrap iç validasyon** → İnteraktif risk hesaplayıcı. "
+            "Hepsini görmek için aşağı kaydırın."
+        )
+
         st.markdown(
             "**Bağımlı değişken:** Komplike Behçet (1) vs Saf Mukokutanöz (0)"
         )
@@ -1507,7 +1515,7 @@ with tab7:
 
             # ─── KALİBRASYON EĞRİSİ + HOSMER-LEMESHOW ───
             st.markdown("---")
-            st.markdown("### 📏 Kalibrasyon — Modelin Güvenilirliği")
+            st.markdown("# 📏 Kalibrasyon — Modelin Güvenilirliği")
             with st.expander("ℹ️ Kalibrasyon nedir, niye önemli?"):
                 st.markdown("""
                 **Ayırt etme (discrimination)** ≠ **kalibrasyon**.
@@ -1636,7 +1644,7 @@ with tab7:
 
             # ─── BOOTSTRAP İÇ VALİDASYON (Harrell yöntemi) ───
             st.markdown("---")
-            st.markdown("### 🔄 Bootstrap İç Validasyon — Optimism-Corrected AUC")
+            st.markdown("# 🔄 Bootstrap İç Validasyon — Optimism-Corrected AUC")
             with st.expander("ℹ️ Bootstrap iç validasyon nedir?"):
                 st.markdown("""
                 Modelin **overfitting** miktarını ölçer. Harici (dış) validasyon yapılamadığında
