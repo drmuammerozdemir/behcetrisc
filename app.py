@@ -293,6 +293,107 @@ def effective_scores(y_true, raw_scores):
     return -np.asarray(raw_scores) if auc(fpr, tpr) < 0.5 else np.asarray(raw_scores)
 
 
+# ====== YARDIMCI: TABLO -> PNG (yayın için 300 DPI) ======
+def df_to_png_bytes(df, title=None, max_col_width=None):
+    """
+    Pandas DataFrame'i 300 DPI yüksek-çözünürlüklü PNG bytes'a çevirir.
+    Makale için doğrudan yapıştırılabilir.
+    """
+    n_rows, n_cols = df.shape
+    # Boyutu içeriğe göre ayarla
+    col_width = 1.5
+    fig_w = max(6, n_cols * col_width)
+    fig_h = max(1.2, 0.45 * (n_rows + 1) + (0.4 if title else 0))
+
+    fig_t, ax_t = plt.subplots(figsize=(fig_w, fig_h))
+    ax_t.axis('off')
+
+    if title:
+        ax_t.set_title(title, fontsize=12, fontweight='bold', pad=10, loc='left')
+
+    # Tablo verisi
+    cell_text = []
+    for _, row in df.iterrows():
+        cell_text.append([str(v) for v in row.values])
+
+    table = ax_t.table(
+        cellText=cell_text,
+        colLabels=df.columns.tolist(),
+        loc='center',
+        cellLoc='center',
+        colLoc='center'
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.5)
+
+    # Başlık satırı stillemesi
+    for j in range(n_cols):
+        cell = table[0, j]
+        cell.set_facecolor('#2E86AB')
+        cell.set_text_props(weight='bold', color='white')
+
+    # Alternatif satır renklendirmesi
+    for i in range(1, n_rows + 1):
+        for j in range(n_cols):
+            cell = table[i, j]
+            if i % 2 == 0:
+                cell.set_facecolor('#f5f5f5')
+
+    if max_col_width:
+        table.auto_set_column_width(col=list(range(n_cols)))
+
+    plt.tight_layout()
+    buf_t = io.BytesIO()
+    fig_t.savefig(buf_t, format='png', dpi=300, bbox_inches='tight',
+                    facecolor='white')
+    plt.close(fig_t)
+    return buf_t.getvalue()
+
+
+def download_buttons_for_table(df, base_filename, label_prefix="", title=None):
+    """
+    Bir DataFrame için iki indirme butonu üretir: CSV + 300 DPI PNG.
+    Yan yana iki sütunda gösterir.
+    """
+    c1, c2 = st.columns(2)
+    with c1:
+        csv = df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            f"📥 {label_prefix}CSV indir",
+            csv,
+            f"{base_filename}.csv",
+            "text/csv",
+            key=f"csv_{base_filename}"
+        )
+    with c2:
+        try:
+            png_bytes = df_to_png_bytes(df, title=title)
+            st.download_button(
+                f"🖼️ {label_prefix}PNG indir (300 DPI)",
+                png_bytes,
+                f"{base_filename}.png",
+                "image/png",
+                key=f"png_{base_filename}"
+            )
+        except Exception:
+            pass
+
+
+def download_fig_300dpi(fig, base_filename, label="Şekli PNG indir (300 DPI)"):
+    """Matplotlib figure için 300 DPI PNG indirme butonu."""
+    buf_f = io.BytesIO()
+    fig.savefig(buf_f, format='png', dpi=300, bbox_inches='tight',
+                  facecolor='white')
+    st.download_button(
+        f"🖼️ {label}",
+        buf_f.getvalue(),
+        f"{base_filename}.png",
+        "image/png",
+        key=f"fig_{base_filename}"
+    )
+
+
 # ====== DOSYA YÜKLEME ======
 uploaded = st.file_uploader(
     "Veri dosyasını seçin (xlsx, xls, csv, sav)",
@@ -536,9 +637,11 @@ with tab2:
 
     st.dataframe(demo_df.style.map(hl_p, subset=['p']), use_container_width=True)
 
-    csv = demo_df.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("📥 Tablo 1'i CSV olarak indir", csv,
-                       "tablo1_demografik.csv", "text/csv")
+    download_buttons_for_table(
+        demo_df, "tablo1_demografik",
+        label_prefix="Tablo 1 — ",
+        title="Tablo 1. Demografik ve Klinik Özellikler"
+    )
 
 # ────────────────────────────────────────────────
 # TAB 3: BİYOMARKER (TABLO 2)
@@ -671,9 +774,11 @@ with tab3:
             else:
                 st.info("Post-hoc için gerekli paket eksik.")
 
-    csv = summary_df.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("📥 Tablo 2'yi CSV olarak indir", csv,
-                       "tablo2_biyomarker.csv", "text/csv")
+    download_buttons_for_table(
+        summary_df, "tablo2_biyomarker",
+        label_prefix="Tablo 2 — ",
+        title="Tablo 2. İnflamatuar Biyomarker Karşılaştırması"
+    )
 
 # ────────────────────────────────────────────────
 # TAB 4: STRIP PLOT (Figure 1 tarzı)
@@ -779,8 +884,9 @@ with tab4:
         # İndirme
         buf = io.BytesIO()
         fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-        st.download_button("📥 Şekli PNG olarak indir", buf.getvalue(),
-                           "stripplot.png", "image/png")
+        st.download_button("🖼️ Strip plot PNG indir (300 DPI)", buf.getvalue(),
+                           "stripplot.png", "image/png",
+                           key="fig_stripplot")
 
 # ────────────────────────────────────────────────
 # TAB 5: SPEARMAN KORELASYON HEATMAP
@@ -841,14 +947,21 @@ with tab5:
                         except Exception:
                             pass
             if sig_rows:
-                st.dataframe(pd.DataFrame(sig_rows).sort_values('p'))
+                sig_df_sorted = pd.DataFrame(sig_rows).sort_values('p').reset_index(drop=True)
+                st.dataframe(sig_df_sorted)
+                download_buttons_for_table(
+                    sig_df_sorted, "anlamli_korelasyonlar",
+                    label_prefix="Anlamlı korelasyonlar — ",
+                    title="Anlamlı Spearman Korelasyonları (p < α)"
+                )
             else:
                 st.info("Anlamlı korelasyon bulunamadı.")
 
         buf = io.BytesIO()
         fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-        st.download_button("📥 Heatmap'i PNG olarak indir", buf.getvalue(),
-                           "correlation_heatmap.png", "image/png")
+        st.download_button("🖼️ Heatmap PNG indir (300 DPI)", buf.getvalue(),
+                           "correlation_heatmap.png", "image/png",
+                           key="fig_heatmap")
     else:
         st.warning("Yeterli veri yok (en az 5 hasta + 2 değişken gerekli).")
 
@@ -932,17 +1045,20 @@ with tab6:
             st.pyplot(fig)
 
             st.subheader("Optimal Cut-off Değerleri (Youden J)")
-            roc_df = pd.DataFrame(roc_results).sort_values('AUC', ascending=False)
+            roc_df = pd.DataFrame(roc_results).sort_values('AUC', ascending=False).reset_index(drop=True)
             st.dataframe(roc_df, use_container_width=True)
 
-            csv = roc_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("📥 ROC sonuçlarını CSV indir", csv,
-                               "roc_results.csv", "text/csv")
+            download_buttons_for_table(
+                roc_df, "roc_sonuclari",
+                label_prefix="ROC sonuçları — ",
+                title="ROC Analizi — Optimal Cut-off Değerleri (Youden J)"
+            )
 
             buf = io.BytesIO()
             fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-            st.download_button("📥 ROC şeklini PNG indir", buf.getvalue(),
-                               "roc_curves.png", "image/png")
+            st.download_button("🖼️ ROC eğrisi PNG indir (300 DPI)", buf.getvalue(),
+                               "roc_curves.png", "image/png",
+                               key="fig_roc_curves")
 
             # ─── DeLong testi: AUC'ler arası karşılaştırma ───
             st.markdown("---")
@@ -996,6 +1112,14 @@ with tab6:
             st.dataframe(display_df.style.map(hl_sig), use_container_width=True)
             st.caption("🟦 koyu mavi: p<0.001 | 🟨 açık mavi: p<0.01 | 🟩 yeşil: p<0.05")
 
+            # DeLong matrisi için indirme (index'i sütun yap)
+            delong_export = display_df.reset_index().rename(columns={'index': 'Parametre'})
+            download_buttons_for_table(
+                delong_export, "delong_pmatrix",
+                label_prefix="DeLong p-matrisi — ",
+                title="DeLong Testi — Çift Yönlü AUC Karşılaştırma Matrisi"
+            )
+
             # En yüksek AUC'li belirteçle diğerlerini özetle
             best_idx = roc_df['AUC'].astype(float).idxmax() if len(roc_df) > 0 else None
             if best_idx is not None and best_idx in roc_df.index:
@@ -1021,7 +1145,13 @@ with tab6:
                     except Exception:
                         pass
                 if rows:
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    delong_compare_df = pd.DataFrame(rows)
+                    st.dataframe(delong_compare_df, use_container_width=True)
+                    download_buttons_for_table(
+                        delong_compare_df, "delong_karsilastirma",
+                        label_prefix="DeLong karşılaştırma — ",
+                        title=f"DeLong Testi — {best_param} vs Diğer Belirteçler"
+                    )
 
 # ────────────────────────────────────────────────
 # YAN PANEL NOTLARI
@@ -1041,8 +1171,8 @@ with tab7:
             "📑 **Bu sekmede sırasıyla:** "
             "Ana belirteç + covariate seçimi → OR tablosu → Forest plot → "
             "Düzeltilmiş ROC → **Nomogram** → **📏 Kalibrasyon eğrisi** → "
-            "**🔄 Bootstrap iç validasyon** → İnteraktif risk hesaplayıcı. "
-            "Hepsini görmek için aşağı kaydırın."
+            "**🔄 Bootstrap iç validasyon** → **👥 Subgroup analizi** → "
+            "İnteraktif risk hesaplayıcı. Hepsini görmek için aşağı kaydırın."
         )
 
         st.markdown(
@@ -1064,15 +1194,19 @@ with tab7:
             )
 
         # Olası covariate'leri tespit et
+        # Hücre sayıları (NEU/MONOSİT/LENFOSİT) ve klinik değişkenler birlikte
         covariate_pool = []
-        for c in ['YAŞ', 'HASTALIK SÜRESİ(yıl)', 'Kolşisin', 'Biyolojik', 'DMARD']:
+        for c in ['NEU', 'MONOSİT', 'LENFOSİT', 'PLT',
+                   'YAŞ', 'HASTALIK SÜRESİ(yıl)',
+                   'Kolşisin', 'Biyolojik', 'DMARD']:
             if c in df.columns: covariate_pool.append(c)
 
         with col2:
             covariates = st.multiselect(
                 "Eş değişkenler (covariates)",
                 covariate_pool,
-                default=[c for c in ['YAŞ', 'HASTALIK SÜRESİ(yıl)'] if c in covariate_pool]
+                default=[c for c in ['YAŞ', 'HASTALIK SÜRESİ(yıl)']
+                          if c in covariate_pool]
             )
 
         # Veriyi hazırla
@@ -1207,6 +1341,12 @@ with tab7:
             st.dataframe(or_df.style.map(hl_or_p, subset=['p']),
                          use_container_width=True)
 
+            download_buttons_for_table(
+                or_df, "regresyon_OR_tablosu",
+                label_prefix="OR tablosu — ",
+                title="Lojistik Regresyon — Odds Ratios (95% CI)"
+            )
+
             # Model fit istatistikleri
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("McFadden Pseudo R²", f"{pseudo_r2:.3f}")
@@ -1249,6 +1389,8 @@ with tab7:
             ax_or.grid(axis='x', alpha=0.3)
             plt.tight_layout()
             st.pyplot(fig_or)
+            download_fig_300dpi(fig_or, "regresyon_forest_plot",
+                                  label="Forest plot PNG indir (300 DPI)")
 
             # ─── Düzeltilmiş vs Düzeltilmemiş ROC ───
             st.markdown("---")
@@ -1282,6 +1424,8 @@ with tab7:
             ax_adj.grid(alpha=0.3)
             plt.tight_layout()
             st.pyplot(fig_adj)
+            download_fig_300dpi(fig_adj, "duzeltilmis_ROC",
+                                  label="Düzeltilmiş ROC PNG indir (300 DPI)")
 
             # DeLong testi: tek vs tam model
             try:
@@ -1505,11 +1649,8 @@ with tab7:
                     fontsize=11, y=0.99
                 )
                 st.pyplot(fig_n)
-
-                buf = io.BytesIO()
-                fig_n.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-                st.download_button("📥 Nomogramı PNG indir", buf.getvalue(),
-                                    "nomogram.png", "image/png")
+                download_fig_300dpi(fig_n, "nomogram",
+                                      label="Nomogram PNG indir (300 DPI)")
             except Exception as e:
                 st.warning(f"Nomogram çizilemedi: {e}")
 
@@ -1632,12 +1773,15 @@ with tab7:
                     cal_df.columns = ['Decile', 'n', 'Gözlenen oran',
                                        'Beklenen oran', 'Gözlenen sayı', 'Beklenen sayı']
                     st.dataframe(cal_df, use_container_width=True)
+                    download_buttons_for_table(
+                        cal_df, "kalibrasyon_decile_tablosu",
+                        label_prefix="Decile tablosu — ",
+                        title="Kalibrasyon — Decile Bazlı Gözlenen vs Beklenen"
+                    )
 
-                # PNG indirme
-                buf = io.BytesIO()
-                fig_cal.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-                st.download_button("📥 Kalibrasyon eğrisini PNG indir",
-                                    buf.getvalue(), "calibration.png", "image/png")
+                # Kalibrasyon eğrisi PNG
+                download_fig_300dpi(fig_cal, "kalibrasyon_egrisi",
+                                      label="Kalibrasyon eğrisi PNG indir (300 DPI)")
 
             except Exception as e:
                 st.warning(f"Kalibrasyon hesaplanamadı: {e}")
@@ -1676,19 +1820,34 @@ with tab7:
 
             if run_boot:
                 try:
+                    # Bootstrap'ta her zaman Firth kullan — MLE separation durumunda
+                    # bootstrap iterasyonlarının çoğunda singular matrix verir.
+                    # Firth tüm durumlarda kararlı çalışır.
+                    boot_method = "Firth"
+                    if not use_firth and separation_warnings:
+                        st.info(
+                            "ℹ️ Veride complete separation var. Bootstrap kararlılığı için "
+                            "**Firth yöntemi** ile çalışacak (MLE'de iterasyonların büyük "
+                            "kısmı singular matrix nedeniyle başarısız olur)."
+                        )
+                    elif not use_firth:
+                        st.caption("Bootstrap için Firth penalization kullanılıyor (kararlılık için).")
+
                     progress = st.progress(0, text="Bootstrap çalışıyor...")
                     rng_boot = np.random.default_rng(42)
                     X_arr = X_lr_const.values
                     y_arr = y_lr.values
                     n = len(y_arr)
 
-                    # Apparent AUC
+                    # Apparent AUC (mevcut model üzerinden)
                     fpr_app, tpr_app, _ = roc_curve(y_arr, pred_full)
                     auc_app = auc(fpr_app, tpr_app)
 
                     optimism_list = []
                     boot_aucs = []
                     test_aucs = []
+                    n_skipped_class = 0
+                    n_skipped_fit = 0
 
                     for b in range(n_boot):
                         # Bootstrap örneklem (yerine koyarak)
@@ -1696,18 +1855,17 @@ with tab7:
                         X_b = X_arr[idx_b]; y_b = y_arr[idx_b]
 
                         # Bootstrap'ta tek sınıf çıkarsa atla
-                        if len(np.unique(y_b)) < 2: continue
+                        if len(np.unique(y_b)) < 2:
+                            n_skipped_class += 1
+                            continue
 
-                        # Bootstrap model fit
+                        # Bootstrap model fit (her durumda Firth — kararlılık için)
                         try:
-                            if use_firth:
-                                fr = firth_logistic_regression(X_b, y_b, max_iter=100)
-                                beta_b = fr['beta']
-                            else:
-                                # Hızlı standart logistic via statsmodels
-                                mb = sm.Logit(y_b, X_b).fit(disp=False, maxiter=100,
-                                                                method='newton')
-                                beta_b = mb.params.values
+                            fr = firth_logistic_regression(X_b, y_b, max_iter=100)
+                            beta_b = fr['beta']
+                            if not np.all(np.isfinite(beta_b)):
+                                n_skipped_fit += 1
+                                continue
 
                             # AUC_boot (bootstrap verisinde)
                             pred_b_on_b = 1/(1+np.exp(-np.clip(X_b @ beta_b, -30, 30)))
@@ -1723,6 +1881,7 @@ with tab7:
                             test_aucs.append(auc_t)
                             optimism_list.append(auc_b - auc_t)
                         except Exception:
+                            n_skipped_fit += 1
                             continue
 
                         if (b+1) % max(1, n_boot//20) == 0:
@@ -1730,6 +1889,14 @@ with tab7:
                                                  text=f"Bootstrap: {b+1}/{n_boot}")
 
                     progress.empty()
+
+                    # Tanılayıcı bilgi
+                    if n_skipped_class > 0 or n_skipped_fit > 0:
+                        st.caption(
+                            f"ℹ️ {len(optimism_list)}/{n_boot} bootstrap başarılı. "
+                            f"Atlanan: {n_skipped_class} (tek sınıf), "
+                            f"{n_skipped_fit} (fit hatası)."
+                        )
 
                     if len(optimism_list) < 10:
                         st.error("Yeterli başarılı bootstrap iterasyonu yok.")
@@ -1810,12 +1977,31 @@ with tab7:
 
                         plt.tight_layout()
                         st.pyplot(fig_b)
+                        download_fig_300dpi(fig_b, "bootstrap_validasyon",
+                                              label="Bootstrap grafikleri PNG indir (300 DPI)")
 
-                        # PNG indirme
-                        buf = io.BytesIO()
-                        fig_b.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-                        st.download_button("📥 Bootstrap grafiklerini PNG indir",
-                                            buf.getvalue(), "bootstrap.png", "image/png")
+                        # Bootstrap özet tablosu (makale Tablo formatında)
+                        bootstrap_summary = pd.DataFrame([{
+                            'Metrik': 'Apparent AUC',
+                            'Değer': f"{auc_app:.4f}"
+                        }, {
+                            'Metrik': 'Ortalama Optimizm',
+                            'Değer': f"{mean_opt:+.4f}"
+                        }, {
+                            'Metrik': 'Optimism-corrected AUC',
+                            'Değer': f"{auc_corrected:.4f}"
+                        }, {
+                            'Metrik': '95% CI (düzeltilmiş)',
+                            'Değer': f"[{auc_ci_lo:.4f}, {auc_ci_hi:.4f}]"
+                        }, {
+                            'Metrik': 'Bootstrap iter (başarılı)',
+                            'Değer': f"{len(optimism_list)}/{n_boot}"
+                        }])
+                        download_buttons_for_table(
+                            bootstrap_summary, "bootstrap_ozet",
+                            label_prefix="Bootstrap özeti — ",
+                            title="Bootstrap İç Validasyon — Özet Sonuçlar"
+                        )
 
                         # Makaleye yazılacak cümle örneği
                         st.info(
@@ -1829,6 +2015,344 @@ with tab7:
                 except Exception as e:
                     st.error(f"Bootstrap çalıştırılamadı: {e}")
                     st.exception(e)
+
+            # ─── SUBGROUP ANALİZİ ───
+            st.markdown("---")
+            st.markdown("# 👥 Subgroup Analizi — Alt Gruplarda Model Performansı")
+            with st.expander("ℹ️ Subgroup analizi nedir, niye önemli?"):
+                st.markdown("""
+                Modelin **farklı alt gruplarda tutarlı performans gösterip göstermediğini**
+                test eder. Hakemler genellikle sorar: *"Modeliniz genel olarak AUC = 0.92,
+                ama 60+ yaş hastalarda da bu kadar iyi mi?"*
+
+                **Her alt grup için hesaplanır:**
+                - **n** — alt grup büyüklüğü
+                - **Olay sayısı** — komplike Behçet hasta sayısı
+                - **AUC** — alt gruba özgü ayırt etme gücü
+                - **95% CI** — bootstrap ile (200 iter)
+
+                **Forest plot** ile görsel sunum yapılır. AUC değerleri ve CI'leri birbirine
+                yakınsa model **alt gruplar arası tutarlı** demektir.
+
+                Makalede ifade: *"Subgroup analyses showed consistent model performance
+                across age groups, sex, and disease duration."*
+                """)
+
+            try:
+                # Alt grup oluşturulabilecek değişkenler — sadece klinik demografik
+                # (Kolşisin/DMARD/Biyolojik çıkarıldı; bunlar tedavi seçimi olduğundan
+                #  reverse causality riski taşır)
+                subgroup_candidates = []
+                for c in ['YAŞ', 'HASTALIK SÜRESİ(yıl)']:
+                    if c in data_lr.columns:
+                        subgroup_candidates.append(c)
+
+                # Klinik eşikler (literatürde Behçet için sık kullanılan)
+                CLINICAL_THRESHOLDS = {
+                    'YAŞ': 40,                    # genç (≤40) vs orta-ileri (>40)
+                    'HASTALIK SÜRESİ(yıl)': 5,    # erken (≤5) vs uzun süreli (>5)
+                }
+
+                if not subgroup_candidates:
+                    st.info("Alt grup analizi için uygun değişken bulunamadı.")
+                else:
+                    sg_col1, sg_col2, sg_col3 = st.columns([2, 1, 1])
+                    with sg_col1:
+                        sg_vars = st.multiselect(
+                            "Alt grup değişkenlerini seçin",
+                            subgroup_candidates,
+                            default=subgroup_candidates,
+                            help="Continuous değişkenler klinik eşiklere göre 2 gruba bölünür"
+                        )
+                    with sg_col2:
+                        split_method = st.radio(
+                            "Eşik yöntemi",
+                            ["Klinik (önerilen)", "Median"],
+                            help=(
+                                "Klinik: Yaş için 40, Süre için 5 yıl "
+                                "(Behçet literatüründe sık kullanılan eşikler).\n\n"
+                                "Median: veri ortancasına göre eşit n'li split."
+                            )
+                        )
+                    with sg_col3:
+                        sg_n_boot = st.number_input(
+                            "Bootstrap (CI)",
+                            min_value=50, max_value=1000, value=200, step=50
+                        )
+
+                    if sg_vars:
+                        # Alt gruplar için stratified AUC hesapla
+                        pred_arr = np.asarray(pred_full).flatten()
+                        y_arr_sg = y_lr.values
+
+                        sg_results = []
+                        rng_sg = np.random.default_rng(123)
+
+                        def auc_with_ci(y_sub, p_sub, n_boot=200, rng=None):
+                            """AUC + bootstrap percentile CI."""
+                            if len(np.unique(y_sub)) < 2:
+                                return np.nan, np.nan, np.nan
+                            fpr_, tpr_, _ = roc_curve(y_sub, p_sub)
+                            auc_pt = auc(fpr_, tpr_)
+                            aucs_b = []
+                            n_s = len(y_sub)
+                            for _ in range(n_boot):
+                                idx = rng.choice(n_s, size=n_s, replace=True)
+                                yb = y_sub[idx]; pb = p_sub[idx]
+                                if len(np.unique(yb)) < 2: continue
+                                try:
+                                    fb, tb, _ = roc_curve(yb, pb)
+                                    aucs_b.append(auc(fb, tb))
+                                except Exception:
+                                    pass
+                            if len(aucs_b) < 10:
+                                return auc_pt, np.nan, np.nan
+                            ci_lo_a = np.percentile(aucs_b, 2.5)
+                            ci_hi_a = np.percentile(aucs_b, 97.5)
+                            return auc_pt, ci_lo_a, ci_hi_a
+
+                        # Genel (overall) AUC referans için
+                        overall_auc, overall_lo, overall_hi = auc_with_ci(
+                            y_arr_sg, pred_arr, n_boot=sg_n_boot, rng=rng_sg
+                        )
+                        sg_results.append({
+                            'group_label': '📊 GENEL (tüm hastalar)',
+                            'variable': '—',
+                            'subgroup': 'All',
+                            'n': len(y_arr_sg),
+                            'events': int(y_arr_sg.sum()),
+                            'event_rate': y_arr_sg.mean(),
+                            'auc': overall_auc,
+                            'ci_lo': overall_lo,
+                            'ci_hi': overall_hi
+                        })
+
+                        # Her subgrup değişkeni için stratify et
+                        for sgv in sg_vars:
+                            col_data = data_lr[sgv]
+
+                            # Eşik seçimi: klinik veya median
+                            if split_method.startswith("Klinik") and sgv in CLINICAL_THRESHOLDS:
+                                threshold = CLINICAL_THRESHOLDS[sgv]
+                                thresh_label = "klinik"
+                            else:
+                                threshold = float(col_data.median())
+                                thresh_label = "median"
+
+                            if sgv == 'YAŞ':
+                                groups = [
+                                    (f"YAŞ ≤ {threshold:.0f} ({thresh_label})",
+                                     col_data <= threshold),
+                                    (f"YAŞ > {threshold:.0f} ({thresh_label})",
+                                     col_data > threshold),
+                                ]
+                            elif 'SÜRE' in sgv.upper():
+                                groups = [
+                                    (f"Süre ≤ {threshold:.0f} yıl ({thresh_label})",
+                                     col_data <= threshold),
+                                    (f"Süre > {threshold:.0f} yıl ({thresh_label})",
+                                     col_data > threshold),
+                                ]
+                            else:
+                                groups = [
+                                    (f"{sgv} ≤ {threshold:.1f}",
+                                     col_data <= threshold),
+                                    (f"{sgv} > {threshold:.1f}",
+                                     col_data > threshold),
+                                ]
+
+                            for label, mask in groups:
+                                mask_arr = mask.values
+                                y_sub = y_arr_sg[mask_arr]
+                                p_sub = pred_arr[mask_arr]
+                                a, lo, hi = auc_with_ci(y_sub, p_sub,
+                                                         n_boot=sg_n_boot,
+                                                         rng=rng_sg)
+                                sg_results.append({
+                                    'group_label': label,
+                                    'variable': sgv,
+                                    'subgroup': label,
+                                    'n': int(mask_arr.sum()),
+                                    'events': int(y_sub.sum()),
+                                    'event_rate': (y_sub.mean()
+                                                    if len(y_sub) > 0 else 0),
+                                    'auc': a,
+                                    'ci_lo': lo,
+                                    'ci_hi': hi
+                                })
+
+                        # ─── Tablo gösterimi ───
+                        sg_df = pd.DataFrame(sg_results)
+                        sg_display = sg_df.copy()
+                        sg_display['n (event)'] = sg_display.apply(
+                            lambda r: f"{r['n']} ({r['events']}, {r['event_rate']:.0%})",
+                            axis=1
+                        )
+                        sg_display['AUC (95% CI)'] = sg_display.apply(
+                            lambda r: (f"{r['auc']:.3f} [{r['ci_lo']:.3f}–{r['ci_hi']:.3f}]"
+                                       if not pd.isna(r['auc']) and not pd.isna(r['ci_lo'])
+                                       else (f"{r['auc']:.3f}" if not pd.isna(r['auc'])
+                                              else "—")),
+                            axis=1
+                        )
+                        table_df = sg_display[['group_label', 'n (event)', 'AUC (95% CI)']].rename(
+                            columns={'group_label': 'Alt Grup'}
+                        )
+                        st.dataframe(table_df, use_container_width=True,
+                                      hide_index=True)
+                        download_buttons_for_table(
+                            table_df, "subgroup_tablosu",
+                            label_prefix="Subgroup tablosu — ",
+                            title="Subgroup Analizi — Alt Gruplarda AUC Performansı"
+                        )
+
+                        # ─── Forest Plot ───
+                        valid = sg_df[~sg_df['auc'].isna()].copy()
+                        valid_forest = valid[~valid['ci_lo'].isna()].reset_index(drop=True)
+
+                        if len(valid_forest) >= 2:
+                            fig_sg, ax_sg = plt.subplots(
+                                figsize=(11, max(4, 0.45 * len(valid_forest) + 1.5))
+                            )
+                            y_pos = np.arange(len(valid_forest))[::-1]  # Üstten alta
+
+                            # Renkleri: overall siyah, diğerleri değişkene göre
+                            color_map = {'—': '#000000'}
+                            cmap = plt.cm.Set2(np.linspace(0, 1, max(1, len(sg_vars))))
+                            for i, sgv in enumerate(sg_vars):
+                                color_map[sgv] = cmap[i]
+                            colors = [color_map.get(v, '#2E86AB')
+                                       for v in valid_forest['variable']]
+
+                            for i, row in valid_forest.iterrows():
+                                yp = y_pos[i]
+                                err_lo = row['auc'] - row['ci_lo']
+                                err_hi = row['ci_hi'] - row['auc']
+                                ax_sg.errorbar(row['auc'], yp,
+                                                xerr=[[err_lo], [err_hi]],
+                                                fmt='o', color=colors[i],
+                                                ecolor=colors[i], capsize=4,
+                                                markersize=9, lw=2)
+                                # Sağda AUC etiketi
+                                ax_sg.text(1.02, yp,
+                                            f" {row['auc']:.3f}",
+                                            va='center', fontsize=9,
+                                            fontweight='bold')
+
+                            # Referans çizgi: overall AUC
+                            ax_sg.axvline(overall_auc, color='gray',
+                                            linestyle='--', alpha=0.6, lw=1,
+                                            label=f'Genel AUC = {overall_auc:.3f}')
+                            # AUC = 0.5 referans
+                            ax_sg.axvline(0.5, color='red', linestyle=':',
+                                            alpha=0.5, lw=1, label='AUC = 0.5 (şans)')
+
+                            ax_sg.set_yticks(y_pos)
+                            ax_sg.set_yticklabels(valid_forest['group_label'],
+                                                   fontsize=10)
+                            ax_sg.set_xlabel("AUC (95% CI)", fontsize=11)
+                            ax_sg.set_xlim(0.4, 1.05)
+                            ax_sg.set_title(
+                                "Alt Grup AUC Forest Plot\n"
+                                f"({len(valid_forest)} grup, bootstrap CI ile)",
+                                fontsize=12
+                            )
+                            ax_sg.legend(loc='lower left', fontsize=9)
+                            ax_sg.grid(axis='x', alpha=0.3)
+                            ax_sg.spines['top'].set_visible(False)
+                            ax_sg.spines['right'].set_visible(False)
+                            plt.tight_layout()
+                            st.pyplot(fig_sg)
+                            download_fig_300dpi(fig_sg, "subgroup_forest_plot",
+                                                  label="Subgroup forest plot PNG indir (300 DPI)")
+
+                        # ─── Heterojenite testi ───
+                        # Her değişken için iki alt grubun AUC'lerini karşılaştır
+                        # DeLong veya basit z-testi (overlapping CIs)
+                        st.markdown("#### 🔬 Heterojenite Testi (Alt Gruplar Arası)")
+                        het_rows = []
+                        for sgv in sg_vars:
+                            sub_rows = valid_forest[valid_forest['variable'] == sgv]
+                            if len(sub_rows) != 2: continue
+                            a1, lo1, hi1 = (sub_rows.iloc[0]['auc'],
+                                              sub_rows.iloc[0]['ci_lo'],
+                                              sub_rows.iloc[0]['ci_hi'])
+                            a2, lo2, hi2 = (sub_rows.iloc[1]['auc'],
+                                              sub_rows.iloc[1]['ci_lo'],
+                                              sub_rows.iloc[1]['ci_hi'])
+                            # Basit z-testi: CI'lerden SE türet
+                            se1 = (hi1 - lo1) / (2 * 1.96)
+                            se2 = (hi2 - lo2) / (2 * 1.96)
+                            se_diff = np.sqrt(se1**2 + se2**2)
+                            if se_diff > 0:
+                                z = (a1 - a2) / se_diff
+                                p_het = 2 * (1 - stats.norm.cdf(abs(z)))
+                            else:
+                                z, p_het = np.nan, np.nan
+                            overlap = (lo1 <= a2 <= hi1) or (lo2 <= a1 <= hi2)
+                            het_rows.append({
+                                'Değişken': sgv,
+                                f'AUC {sub_rows.iloc[0]["group_label"]}': f"{a1:.3f}",
+                                f'AUC {sub_rows.iloc[1]["group_label"]}': f"{a2:.3f}",
+                                'ΔAUC': f"{a1-a2:+.3f}",
+                                'CI Overlap': "✅ Var" if overlap else "❌ Yok",
+                                'p (yaklaşık)': fmt_p(p_het)
+                            })
+                        if het_rows:
+                            # Sadece ΔAUC ve p'yi standartlaştır, isimleri sadeleştir
+                            het_df = pd.DataFrame([
+                                {'Değişken': r['Değişken'],
+                                 'ΔAUC': r['ΔAUC'],
+                                 'CI Çakışıyor': r['CI Overlap'],
+                                 'p': r['p (yaklaşık)']}
+                                for r in het_rows
+                            ])
+
+                            def hl_het(v):
+                                try:
+                                    if v == "<0.001": return 'background-color: #FADBD8'
+                                    return ('background-color: #FADBD8'
+                                            if float(v) < 0.05 else
+                                            'background-color: #D4EFDF')
+                                except: return ''
+
+                            st.dataframe(het_df.style.map(hl_het, subset=['p']),
+                                          use_container_width=True)
+                            st.caption(
+                                "🟩 yeşil: p ≥ 0.05 → alt gruplar arası fark yok "
+                                "(model tutarlı) · 🟥 kırmızı: p < 0.05 → anlamlı fark "
+                                "(model alt gruplar arası farklı performans gösteriyor)"
+                            )
+                            download_buttons_for_table(
+                                het_df, "heterojenite_tablosu",
+                                label_prefix="Heterojenite — ",
+                                title="Subgroup Heterojenite Testi"
+                            )
+
+                            # Otomatik klinik yorum
+                            n_consistent = sum(1 for r in het_rows
+                                                 if (r['p (yaklaşık)'] != '<0.001' and
+                                                     float(r['p (yaklaşık)']) >= 0.05)
+                                                 or r['CI Overlap'] == '✅ Var')
+                            if n_consistent == len(het_rows):
+                                st.success(
+                                    f"✅ Tüm {len(het_rows)} alt grupta model performansı "
+                                    "**tutarlı** — heterojenite tespit edilmedi."
+                                )
+                            elif n_consistent > 0:
+                                st.info(
+                                    f"ℹ️ {n_consistent}/{len(het_rows)} alt grupta model "
+                                    "tutarlı, diğerlerinde sınırlı heterojenite var."
+                                )
+                            else:
+                                st.warning(
+                                    "⚠️ Birden fazla alt grupta anlamlı heterojenite var. "
+                                    "Modelin alt grup-spesifik kalibrasyonu önerilebilir."
+                                )
+
+            except Exception as e:
+                st.warning(f"Subgroup analizi çalıştırılamadı: {e}")
+                st.exception(e)
 
             # ─── İNTERAKTİF RİSK HESAPLAYICI ───
             st.markdown("---")
