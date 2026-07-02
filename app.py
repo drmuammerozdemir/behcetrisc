@@ -347,15 +347,39 @@ def build_nomogram(highlight=None):
         b * r["min"] if b > 0 else b * r["max"]
         for _, b, r in predictors
     )
-    prob_levels = [0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95]
-    pticks, plabels = [], []
-    for p in prob_levels:
+
+    def tp_to_prob(tp):
+        eta = intercept + min_contrib + tp / scale
+        return 1.0 / (1.0 + math.exp(-max(-30, min(30, eta))))
+
+    def prob_to_tp(p):
         lp = math.log(p / (1 - p))
-        lp_total = lp - intercept
-        tp = (lp_total - min_contrib) * scale
-        if 0 <= tp <= total_max:
-            pticks.append(tp)
-            plabels.append(f"{p:.2f}")
+        return (lp - intercept - min_contrib) * scale
+
+    # Total Points ekseninin kapsadığı gerçek olasılık aralığı
+    p_lo = tp_to_prob(0)
+    p_hi = tp_to_prob(total_max)
+
+    # Olasılık ekseni KENDİ genişliğini kullansın (Total Points'e sıkışmasın).
+    # Etiket olasılıklarının gerçek TP konumlarını al, sonra bu [tp_min, tp_max]
+    # aralığını 0..total_max fiziksel genişliğe lineer ölçekle → tüm eksen dolu.
+    all_levels = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5,
+                  0.6, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99]
+    visible = [p for p in all_levels if p_lo <= p <= p_hi]
+    if len(visible) < 2:
+        visible = [p_lo, p_hi]
+
+    tp_positions = [prob_to_tp(p) for p in visible]
+    tp_span_lo, tp_span_hi = min(tp_positions), max(tp_positions)
+    span = (tp_span_hi - tp_span_lo) or 1.0
+
+    def remap(tp):
+        """Gerçek TP konumunu, olasılık ekseninin tüm genişliğine (0..total_max) yay."""
+        return (tp - tp_span_lo) / span * total_max
+
+    pticks = [remap(prob_to_tp(p)) for p in visible]
+    plabels = [f"{p:.2f}" for p in visible]
+
     # de-collide
     if pticks:
         min_gap = total_max * 0.045
@@ -363,7 +387,18 @@ def build_nomogram(highlight=None):
         for t, l in zip(pticks[1:], plabels[1:]):
             if t - ft[-1] >= min_gap:
                 ft.append(t); fl.append(l)
+        if pticks[-1] != ft[-1]:
+            if pticks[-1] - ft[-1] >= min_gap * 0.6:
+                ft.append(pticks[-1]); fl.append(plabels[-1])
+            else:
+                ft[-1] = pticks[-1]; fl[-1] = plabels[-1]
         pticks, plabels = ft, fl
+
+    # Hasta marker'ını da aynı remap ile yerleştir
+    if tp_mark_disp is not None:
+        prob_mark = remap(max(tp_span_lo, min(tp_span_hi, total_patient_pts)))
+    else:
+        prob_mark = None
 
     axp = axes[-1]
     axp.set_xlim(-2, total_max * 1.02 + 2)
@@ -372,8 +407,8 @@ def build_nomogram(highlight=None):
     for t, l in zip(pticks, plabels):
         axp.vlines(t, 0.4, 0.6, color="#F18F01", lw=1.2)
         axp.text(t, -0.18, l, ha="center", va="top", fontsize=9)
-    if tp_mark_disp is not None:
-        axp.plot(tp_mark_disp, 0.5, "v", color="#c0392b", markersize=11, zorder=5)
+    if prob_mark is not None:
+        axp.plot(prob_mark, 0.5, "v", color="#c0392b", markersize=11, zorder=5)
     axp.set_yticks([]); axp.set_xticks([])
     axp.set_ylabel("Predicted\nProbability\n(Complicated)", rotation=0,
                    ha="right", va="center", fontsize=10, labelpad=18, fontweight="bold")
@@ -413,5 +448,5 @@ This tool does not replace medical advice.
 st.markdown("---")
 st.caption(
     "Behçet Nomogram Calculator · NEU + MONO + LYMPH model · "
-    "Firth penalized logistic regression · No data stored. ©HVMLab2026"
+    "Firth penalized logistic regression · No data stored."
 )
