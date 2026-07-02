@@ -413,5 +413,5 @@ This tool does not replace medical advice.
 st.markdown("---")
 st.caption(
     "Behçet Nomogram Calculator · NEU + MONO + LYMPH model · "
-    "Firth penalized logistic regression · No data stored."
+    "Firth penalized logistic regression · No data stored. ©HVMLab2026"
 )
