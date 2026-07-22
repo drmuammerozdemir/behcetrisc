@@ -2,7 +2,7 @@
 """
 Behçet Nomogram Calculator — Standalone
 ========================================
-Complicated Behçet's Disease (vasculitis/uveitis) risk prediction
+Major Organ Involvement (vasculitis/uveitis) risk prediction
 from CBC components (Neutrophil, Monocyte, Lymphocyte).
 
 Model: Firth penalized logistic regression, n=179, AUC 0.921.
@@ -100,7 +100,7 @@ st.markdown(
 with st.expander("ℹ️ About this calculator"):
     st.markdown(f"""
     This tool estimates the probability that a patient with Behçet's disease has
-    **complicated disease** (vascular and/or ocular involvement) versus
+    **Major Organ Involvement** (vascular and/or ocular involvement) versus
     **purely mucocutaneous disease**, based on three complete blood count (CBC)
     components: neutrophil, monocyte, and lymphocyte counts.
 
