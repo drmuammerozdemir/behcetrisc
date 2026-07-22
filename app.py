@@ -416,7 +416,7 @@ def build_nomogram(highlight=None):
         sp.set_visible(False)
 
     fig.suptitle(
-        f"Nomogram — Complicated Behçet's Disease Risk\n"
+        f"Nomogram — Major Organ Involvement in Behçet's Disease\n"
         f"(AUC = {MODEL_AUC}, n = {MODEL_N}, Firth penalized regression)",
         fontsize=11, y=0.98
     )
